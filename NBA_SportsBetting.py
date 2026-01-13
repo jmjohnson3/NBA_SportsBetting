@@ -72,26 +72,36 @@ API_CACHE_TTL_MINUTES = 60
 
 session = None
 api_cache_initialized = False
+api_cache_available = True
 
 
 def get_db_connection():
-    conn = psycopg2.connect(
-        user=HARD_CODED_PG_USER,
-        password=HARD_CODED_PG_PASSWORD,
-        host=HARD_CODED_PG_HOST,
-        port=HARD_CODED_PG_PORT,
-        dbname=HARD_CODED_PG_DATABASE,
-        connect_timeout=5
-    )
+    try:
+        conn = psycopg2.connect(
+            user=HARD_CODED_PG_USER,
+            password=HARD_CODED_PG_PASSWORD,
+            host=HARD_CODED_PG_HOST,
+            port=HARD_CODED_PG_PORT,
+            dbname=HARD_CODED_PG_DATABASE,
+            connect_timeout=5
+        )
+    except psycopg2.OperationalError as exc:
+        logging.error("Postgres connection failed: %s", exc)
+        return None
     conn.autocommit = True
     return conn
 
 
 def init_api_cache() -> None:
-    global api_cache_initialized
+    global api_cache_initialized, api_cache_available
     if api_cache_initialized:
         return
-    with get_db_connection() as conn:
+    conn = get_db_connection()
+    if conn is None:
+        api_cache_available = False
+        api_cache_initialized = True
+        return
+    with conn:
         with conn.cursor() as cursor:
             cursor.execute(
                 """
@@ -117,6 +127,7 @@ def init_api_cache() -> None:
                 """
             )
     api_cache_initialized = True
+    api_cache_available = True
 
 
 def _serialize_json(payload: dict) -> str:
@@ -128,7 +139,12 @@ def _hash_json(serialized: str) -> str:
 
 
 def get_cached_response(url: str):
-    with get_db_connection() as conn:
+    if not api_cache_available:
+        return None, None
+    conn = get_db_connection()
+    if conn is None:
+        return None, None
+    with conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cursor:
             cursor.execute(
                 """
@@ -147,9 +163,14 @@ def get_cached_response(url: str):
 
 
 def cache_response(url: str, payload: dict) -> bool:
+    if not api_cache_available:
+        return False
     serialized = _serialize_json(payload)
     response_hash = _hash_json(serialized)
-    with get_db_connection() as conn:
+    conn = get_db_connection()
+    if conn is None:
+        return False
+    with conn:
         with conn.cursor() as cursor:
             cursor.execute(
                 """
@@ -1394,19 +1415,23 @@ def process_injuries(injuries_data):
 
 def fetch_api_data(url, max_retries=3, refresh=False, cache_ttl_minutes=API_CACHE_TTL_MINUTES):
     init_api_cache()
-    cached_data, cached_at = get_cached_response(url)
-    if cached_data is not None and not refresh:
-        if cache_ttl_minutes is None or is_cache_fresh(cached_at, cache_ttl_minutes):
-            return cached_data
+    cached_data = None
+    cached_at = None
+    if api_cache_available:
+        cached_data, cached_at = get_cached_response(url)
+        if cached_data is not None and not refresh:
+            if cache_ttl_minutes is None or is_cache_fresh(cached_at, cache_ttl_minutes):
+                return cached_data
     session = get_http_session()
     for attempt in range(max_retries):
         try:
             response = session.get(url)
             if response.status_code == 200:
                 payload = response.json()
-                inserted = cache_response(url, payload)
-                if inserted:
-                    logging.info("Cached new API response for %s", url)
+                if api_cache_available:
+                    inserted = cache_response(url, payload)
+                    if inserted:
+                        logging.info("Cached new API response for %s", url)
                 return payload
             elif response.status_code == 204:
                 logging.warning("Received 204 (No Content) from %s", url)

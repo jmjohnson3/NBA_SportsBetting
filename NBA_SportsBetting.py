@@ -71,19 +71,26 @@ HARD_CODED_PG_DATABASE = "nfl"
 API_CACHE_TTL_MINUTES = 60
 
 session = None
+api_cache_initialized = False
 
 
 def get_db_connection():
-    return psycopg2.connect(
+    conn = psycopg2.connect(
         user=HARD_CODED_PG_USER,
         password=HARD_CODED_PG_PASSWORD,
         host=HARD_CODED_PG_HOST,
         port=HARD_CODED_PG_PORT,
-        dbname=HARD_CODED_PG_DATABASE
+        dbname=HARD_CODED_PG_DATABASE,
+        connect_timeout=5
     )
+    conn.autocommit = True
+    return conn
 
 
 def init_api_cache() -> None:
+    global api_cache_initialized
+    if api_cache_initialized:
+        return
     with get_db_connection() as conn:
         with conn.cursor() as cursor:
             cursor.execute(
@@ -109,6 +116,7 @@ def init_api_cache() -> None:
                 ON api_cache(url, response_hash)
                 """
             )
+    api_cache_initialized = True
 
 
 def _serialize_json(payload: dict) -> str:

@@ -72,7 +72,6 @@ API_CACHE_TTL_MINUTES = 60
 
 session = None
 api_cache_initialized = False
-api_cache_available = True
 
 
 def get_db_connection():
@@ -87,20 +86,21 @@ def get_db_connection():
         )
     except psycopg2.OperationalError as exc:
         logging.error("Postgres connection failed: %s", exc)
-        return None
+        raise
     conn.autocommit = True
     return conn
 
 
 def init_api_cache() -> None:
-    global api_cache_initialized, api_cache_available
+    global api_cache_initialized
     if api_cache_initialized:
         return
-    conn = get_db_connection()
-    if conn is None:
-        api_cache_available = False
-        api_cache_initialized = True
-        return
+    try:
+        conn = get_db_connection()
+    except psycopg2.OperationalError as exc:
+        raise RuntimeError(
+            "Postgres is required for API caching. Start the database or update the connection settings."
+        ) from exc
     with conn:
         with conn.cursor() as cursor:
             cursor.execute(
@@ -127,7 +127,6 @@ def init_api_cache() -> None:
                 """
             )
     api_cache_initialized = True
-    api_cache_available = True
 
 
 def _serialize_json(payload: dict) -> str:
@@ -139,11 +138,7 @@ def _hash_json(serialized: str) -> str:
 
 
 def get_cached_response(url: str):
-    if not api_cache_available:
-        return None, None
     conn = get_db_connection()
-    if conn is None:
-        return None, None
     with conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cursor:
             cursor.execute(
@@ -163,13 +158,9 @@ def get_cached_response(url: str):
 
 
 def cache_response(url: str, payload: dict) -> bool:
-    if not api_cache_available:
-        return False
     serialized = _serialize_json(payload)
     response_hash = _hash_json(serialized)
     conn = get_db_connection()
-    if conn is None:
-        return False
     with conn:
         with conn.cursor() as cursor:
             cursor.execute(
@@ -1417,21 +1408,19 @@ def fetch_api_data(url, max_retries=3, refresh=False, cache_ttl_minutes=API_CACH
     init_api_cache()
     cached_data = None
     cached_at = None
-    if api_cache_available:
-        cached_data, cached_at = get_cached_response(url)
-        if cached_data is not None and not refresh:
-            if cache_ttl_minutes is None or is_cache_fresh(cached_at, cache_ttl_minutes):
-                return cached_data
+    cached_data, cached_at = get_cached_response(url)
+    if cached_data is not None and not refresh:
+        if cache_ttl_minutes is None or is_cache_fresh(cached_at, cache_ttl_minutes):
+            return cached_data
     session = get_http_session()
     for attempt in range(max_retries):
         try:
             response = session.get(url)
             if response.status_code == 200:
                 payload = response.json()
-                if api_cache_available:
-                    inserted = cache_response(url, payload)
-                    if inserted:
-                        logging.info("Cached new API response for %s", url)
+                inserted = cache_response(url, payload)
+                if inserted:
+                    logging.info("Cached new API response for %s", url)
                 return payload
             elif response.status_code == 204:
                 logging.warning("Received 204 (No Content) from %s", url)

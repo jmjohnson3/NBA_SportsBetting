@@ -2519,6 +2519,7 @@ def main():
         print("Deduplicated parsed games dataframe shape:", games_df.shape)
 
     print("Games parsed shape:", games_df.shape)
+    games_df["local_date"] = pd.to_datetime(games_df["local_date"]).dt.date
     player_stats_df = deduplicate_player_stats(player_stats_df, players_data)
     print("Deduplicated player stats dataframe shape:", player_stats_df.shape)
     player_stats_df = override_team_info(player_stats_df, players_data)
@@ -2652,7 +2653,7 @@ def main():
         lambda x: x.get("abbreviation").upper().strip() if isinstance(x, dict) else str(x).upper().strip())
     games_df["away_team_abbr"] = games_df["awayTeam"].apply(
         lambda x: x.get("abbreviation").upper().strip() if isinstance(x, dict) else str(x).upper().strip())
-    games_today_df = games_df[games_df['local_date'] == pd.Timestamp(TARGET_DATE)]
+    games_today_df = games_df[games_df['local_date'] == TARGET_DATE]
     print("games_today_df shape:", games_today_df.shape)
     nba_odds = get_nba_odds()
     player_model, player_stats_ready_df, feat_cols, target_cols = train_player_stats_model_with_optuna(

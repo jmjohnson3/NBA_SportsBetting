@@ -68,7 +68,7 @@ HARD_CODED_PG_USER = "josh"
 HARD_CODED_PG_PASSWORD = "password"
 HARD_CODED_PG_HOST = "localhost"
 HARD_CODED_PG_PORT = "5432"
-HARD_CODED_PG_DATABASE = "nfl"
+HARD_CODED_PG_DATABASE = "nba"
 API_CACHE_TTL_MINUTES = 60
 
 session = None
@@ -544,10 +544,10 @@ def train_autokeras_game_model(X, y, max_trials=3, epochs=50):
 # NEW: Reinforcement Learning (RL) for Dynamic Betting Adjustment
 # -------------------------------
 try:
-    import gym
-    from gym import spaces
+    import gymnasium as gym
+    from gymnasium import spaces
 except ImportError:
-    print("gym is not installed. Please install with: pip install gym")
+    print("Gymnasium is not installed. Please install with: pip install gymnasium")
     gym = None
 
 try:

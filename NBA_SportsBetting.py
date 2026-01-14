@@ -1425,7 +1425,11 @@ def fetch_api_data(url, max_retries=3, refresh=False, cache_ttl_minutes=API_CACH
                 return payload
             elif response.status_code == 204:
                 logging.warning("Received 204 (No Content) from %s", url)
-                return cached_data or {}
+                payload = {}
+                inserted = cache_response(url, payload)
+                if inserted:
+                    logging.info("Cached empty API response for %s", url)
+                return cached_data or payload
             elif response.status_code == 429:
                 retry_after = int(response.headers.get("Retry-After", 2))
                 time.sleep(retry_after)

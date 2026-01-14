@@ -5,6 +5,7 @@ import logging
 import math
 import json
 import hashlib
+import os
 import psycopg2
 import psycopg2.extras
 import io
@@ -63,7 +64,7 @@ DATE_FORMAT = "iso"
 ODDS_BASE_URL = "https://api.the-odds-api.com/v4/sports"
 seasons = ["2023-2024", "2024-2025", "2025-2026"]
 TODAY = datetime.now(pytz.timezone("US/Eastern")).date()
-TARGET_DATE = TODAY - timedelta(days=1)
+TARGET_DATE = TODAY
 HARD_CODED_PG_USER = "josh"
 HARD_CODED_PG_PASSWORD = "password"
 HARD_CODED_PG_HOST = "localhost"
@@ -544,6 +545,7 @@ def train_autokeras_game_model(X, y, max_trials=3, epochs=50):
 # NEW: Reinforcement Learning (RL) for Dynamic Betting Adjustment
 # -------------------------------
 try:
+    os.environ.setdefault("GYM_DISABLE_WARNINGS", "1")
     import gymnasium as gym
     from gymnasium import spaces
 except ImportError:

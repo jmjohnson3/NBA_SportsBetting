@@ -63,6 +63,7 @@ DATE_FORMAT = "iso"
 ODDS_BASE_URL = "https://api.the-odds-api.com/v4/sports"
 seasons = ["2023-2024", "2024-2025", "2025-2026"]
 TODAY = datetime.now(pytz.timezone("US/Eastern")).date()
+TARGET_DATE = TODAY - timedelta(days=1)
 HARD_CODED_PG_USER = "josh"
 HARD_CODED_PG_PASSWORD = "password"
 HARD_CODED_PG_HOST = "localhost"
@@ -1628,14 +1629,14 @@ def fetch_season_data(season):
     return data
 
 
-def fetch_game_details(season, game):
+def fetch_game_details(season, game, target_date=TARGET_DATE):
     details = {}
     game_info = game.get("schedule", game)
     start_time = game_info.get("startTime")
     if not start_time:
         return details
     game_date = parser.isoparse(start_time).date()
-    if game_date > date.today():
+    if game_date != target_date:
         return details
     date_str = get_local_game_date(start_time, tz="US/Eastern")
     away_team = game_info.get("awayTeam", {}).get("abbreviation") or game_info.get("awayTeamAbbreviation")
@@ -1679,8 +1680,9 @@ def ingest_data():
             game_id = game.get("id") or game.get("schedule", {}).get("id")
             if game_id:
                 game_id = str(game_id)
-                details = fetch_game_details(season, game)
-                game_details_for_season[game_id] = details
+                details = fetch_game_details(season, game, target_date=TARGET_DATE)
+                if details:
+                    game_details_for_season[game_id] = details
         all_games_details[season] = game_details_for_season
     print("Ingested all season data.")
     return current_season_data, players_data, injuries_data, all_season_data, all_games_details
@@ -2128,7 +2130,7 @@ def add_rest_features(games_df, historical_games):
                         extract_abbr(row.get("awayTeam")) == team_abbr), axis=1)]
         if not team_games.empty:
             last_date = team_games["local_date"].max()
-            return (TODAY - last_date).days
+            return (TARGET_DATE - last_date).days
         return None
 
     games_df["home_team_days_rest"] = games_df["home_team_abbr"].apply(lambda abbr: days_rest_for_team(abbr))
@@ -2425,7 +2427,7 @@ def add_rest_features(games_df, historical_games):
                         extract_abbr(row.get("awayTeam")) == team_abbr), axis=1)]
         if not team_games.empty:
             last_date = team_games["local_date"].max()
-            return (TODAY - last_date).days
+            return (TARGET_DATE - last_date).days
         return None
 
     games_df["home_team_days_rest"] = games_df["home_team_abbr"].apply(lambda abbr: days_rest_for_team(abbr))
@@ -2520,18 +2522,18 @@ def main():
 
     boxscore_df, playbyplay_df = parse_detailed_game_data(all_games_details)
     TEAM_LOCATIONS = get_team_locations(venues_df)
-    teams_with_games = get_teams_with_games(games_df, TODAY)
-    print("Teams with games on", TODAY, ":", teams_with_games)
-    daily_player_gamelogs = fetch_daily_player_gamelogs_for_teams(seasons[-1], TODAY, teams_with_games)
+    teams_with_games = get_teams_with_games(games_df, TARGET_DATE)
+    print("Teams with games on", TARGET_DATE, ":", teams_with_games)
+    daily_player_gamelogs = fetch_daily_player_gamelogs_for_teams(seasons[-1], TARGET_DATE, teams_with_games)
     if daily_player_gamelogs.empty:
-        print("No daily player gamelog data available for TODAY.")
+        print("No daily player gamelog data available for TARGET_DATE.")
 
     # Separate historical games and today's games.
-    historical_games = games_df[games_df["local_date"] < TODAY].copy()
-    todays_games = games_df[games_df["local_date"] == TODAY].copy()
+    historical_games = games_df[games_df["local_date"] < TARGET_DATE].copy()
+    todays_games = games_df[games_df["local_date"] == TARGET_DATE].copy()
     print(f"Total games ingested: {games_df.shape[0]}")
     print(f"Historical games (for training): {historical_games.shape}")
-    print(f"Today's games (for prediction): {todays_games.shape}")
+    print(f"Target date games (for prediction): {todays_games.shape}")
 
     # ---
     # INSERTED IMPROVEMENTS: Enhanced feature engineering for historical games.
@@ -2549,11 +2551,11 @@ def main():
     if "stats" in team_stats_df.columns:
         team_stats_flat = pd.json_normalize(team_stats_df["stats"]).add_prefix("stats_")
         team_stats_df = pd.concat([team_stats_df.drop(columns=["stats"]), team_stats_flat], axis=1)
-    historical_games = games_df[games_df["local_date"] < TODAY].copy()
-    todays_games = games_df[games_df["local_date"] == TODAY].copy()
+    historical_games = games_df[games_df["local_date"] < TARGET_DATE].copy()
+    todays_games = games_df[games_df["local_date"] == TARGET_DATE].copy()
     print(f"Total games ingested: {games_df.shape[0]}")
     print(f"Historical games (for training): {historical_games.shape}")
-    print(f"Today's games (for prediction): {todays_games.shape}")
+    print(f"Target date games (for prediction): {todays_games.shape}")
     todays_games = add_rest_features(todays_games, historical_games)
     todays_games = add_schedule_congestion(todays_games, window_days=7)
     todays_games = add_travel_distance_feature(todays_games, TEAM_LOCATIONS, historical_games)
@@ -2646,7 +2648,7 @@ def main():
         lambda x: x.get("abbreviation").upper().strip() if isinstance(x, dict) else str(x).upper().strip())
     games_df["away_team_abbr"] = games_df["awayTeam"].apply(
         lambda x: x.get("abbreviation").upper().strip() if isinstance(x, dict) else str(x).upper().strip())
-    games_today_df = games_df[games_df['local_date'] == pd.Timestamp(TODAY)]
+    games_today_df = games_df[games_df['local_date'] == pd.Timestamp(TARGET_DATE)]
     print("games_today_df shape:", games_today_df.shape)
     nba_odds = get_nba_odds()
     player_model, player_stats_ready_df, feat_cols, target_cols = train_player_stats_model_with_optuna(

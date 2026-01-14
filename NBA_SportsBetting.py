@@ -1635,8 +1635,8 @@ def fetch_game_details(season, game, target_date=TARGET_DATE):
     start_time = game_info.get("startTime")
     if not start_time:
         return details
-    game_date = parser.isoparse(start_time).date()
-    if game_date != target_date:
+    local_game_date = parser.isoparse(start_time).astimezone(pytz.timezone("US/Eastern")).date()
+    if local_game_date != target_date:
         return details
     date_str = get_local_game_date(start_time, tz="US/Eastern")
     away_team = game_info.get("awayTeam", {}).get("abbreviation") or game_info.get("awayTeamAbbreviation")

@@ -65,6 +65,7 @@ ODDS_BASE_URL = "https://api.the-odds-api.com/v4/sports"
 seasons = ["2023-2024", "2024-2025", "2025-2026"]
 TODAY = datetime.now(pytz.timezone("US/Eastern")).date()
 TARGET_DATE = TODAY
+CACHE_ONLY_SEASONS = {"2024-2025"}
 HARD_CODED_PG_USER = "josh"
 HARD_CODED_PG_PASSWORD = "password"
 HARD_CODED_PG_HOST = "localhost"
@@ -723,9 +724,9 @@ async def async_fetch_api_data(url: str, refresh: bool = False) -> dict:
 
 
 
-def fetch_games_data(api_url: str) -> dict:
+def fetch_games_data(api_url: str, cache_only: bool = False) -> dict:
     logger = logging.getLogger(__name__)
-    data = fetch_api_data(api_url)
+    data = fetch_api_data(api_url, cache_only=cache_only)
     if data is None:
         logger.error("No data returned for games endpoint %s", api_url)
         raise ValueError("No data returned for games endpoint")
@@ -735,8 +736,8 @@ def fetch_games_data(api_url: str) -> dict:
     return data
 
 
-def flatten_games_data(api_url: str) -> pd.DataFrame:
-    data = fetch_games_data(api_url)
+def flatten_games_data(api_url: str, cache_only: bool = False) -> pd.DataFrame:
+    data = fetch_games_data(api_url, cache_only=cache_only)
     games = data["games"]
     print(f"Loaded {len(games)} games from API.")
     df_main = pd.json_normalize(games, sep="_")
@@ -760,9 +761,9 @@ def flatten_games_data(api_url: str) -> pd.DataFrame:
     return df_main
 
 
-def fetch_venues_data(api_url: str) -> dict:
+def fetch_venues_data(api_url: str, cache_only: bool = False) -> dict:
     logger = logging.getLogger(__name__)
-    data = fetch_api_data(api_url)
+    data = fetch_api_data(api_url, cache_only=cache_only)
     if data is None:
         logger.error("No data returned for venues endpoint %s", api_url)
         raise ValueError("No data returned for venues endpoint")
@@ -772,8 +773,8 @@ def fetch_venues_data(api_url: str) -> dict:
     return data
 
 
-def flatten_venues_data(api_url: str):
-    data = fetch_venues_data(api_url)
+def flatten_venues_data(api_url: str, cache_only: bool = False):
+    data = fetch_venues_data(api_url, cache_only=cache_only)
     venues = data["venues"]
     print(f"Loaded {len(venues)} venues from API.")
     df_main = pd.json_normalize(venues, sep="_")
@@ -1407,7 +1408,8 @@ def process_injuries(injuries_data):
     return df_injuries
 
 
-def fetch_api_data(url, max_retries=3, refresh=False, cache_ttl_minutes=API_CACHE_TTL_MINUTES):
+def fetch_api_data(url, max_retries=3, refresh=False, cache_ttl_minutes=API_CACHE_TTL_MINUTES,
+                   cache_only: bool = False):
     init_api_cache()
     cached_data = None
     cached_at = None
@@ -1415,6 +1417,8 @@ def fetch_api_data(url, max_retries=3, refresh=False, cache_ttl_minutes=API_CACH
     if cached_data is not None and not refresh:
         if cache_ttl_minutes is None or is_cache_fresh(cached_at, cache_ttl_minutes):
             return cached_data
+    if cache_only:
+        raise RuntimeError(f"Cache-only mode enabled; no cached data available for {url}.")
     session = get_http_session()
     for attempt in range(max_retries):
         try:
@@ -1625,12 +1629,19 @@ def compute_team_momentum(historical_games, team_abbr, n=3):
 
 def fetch_season_data(season):
     data = {}
-    data["seasonal_games"] = fetch_api_data(endpoints["seasonal_games"].format(season=season))
-    data["seasonal_venues"] = fetch_api_data(endpoints["seasonal_venues"].format(season=season))
-    data["seasonal_team_stats"] = fetch_api_data(endpoints["seasonal_team_stats"].format(season=season))
-    data["seasonal_player_stats"] = fetch_api_data(endpoints["seasonal_player_stats"].format(season=season))
-    data["seasonal_standings"] = fetch_api_data(endpoints["seasonal_standings"].format(season=season))
-    data["latest_updates"] = fetch_api_data(endpoints["latest_updates"].format(season=season))
+    cache_only = season in CACHE_ONLY_SEASONS
+    data["seasonal_games"] = fetch_api_data(endpoints["seasonal_games"].format(season=season),
+                                            cache_only=cache_only)
+    data["seasonal_venues"] = fetch_api_data(endpoints["seasonal_venues"].format(season=season),
+                                             cache_only=cache_only)
+    data["seasonal_team_stats"] = fetch_api_data(endpoints["seasonal_team_stats"].format(season=season),
+                                                 cache_only=cache_only)
+    data["seasonal_player_stats"] = fetch_api_data(endpoints["seasonal_player_stats"].format(season=season),
+                                                   cache_only=cache_only)
+    data["seasonal_standings"] = fetch_api_data(endpoints["seasonal_standings"].format(season=season),
+                                                cache_only=cache_only)
+    data["latest_updates"] = fetch_api_data(endpoints["latest_updates"].format(season=season),
+                                            cache_only=cache_only)
     print(f"Fetched season data for {season}")
     return data
 
@@ -2496,7 +2507,8 @@ def main():
 
     print("Fetching games data...")
     try:
-        df_games = flatten_games_data(endpoints["seasonal_games"].format(season="2024-2025"))
+        df_games = flatten_games_data(endpoints["seasonal_games"].format(season="2024-2025"),
+                                      cache_only=True)
         print("Games dataframe shape:", df_games.shape)
     except Exception as e:
         logging.error("Failed to process games data: %s", e)
@@ -2507,7 +2519,8 @@ def main():
 
     print("Fetching venues data...")
     try:
-        df_venues, _ = flatten_venues_data(endpoints["seasonal_venues"].format(season="2024-2025"))
+        df_venues, _ = flatten_venues_data(endpoints["seasonal_venues"].format(season="2024-2025"),
+                                           cache_only=True)
         print("Venues dataframe shape:", df_venues.shape)
     except Exception as e:
         logging.error("Failed to process venues data: %s", e)

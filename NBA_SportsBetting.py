@@ -1255,14 +1255,18 @@ def format_playbook_bet(player_name: str, market: str, line: float, direction: s
     return f"{player_name} {direction} {line} {market_label}"
 
 
-def send_discord_value_bets(value_bets):
+def send_discord_value_bets(value_bets_by_game):
     if not DISCORD_WEBHOOK_URL:
         logging.info("DISCORD_WEBHOOK_URL not set; skipping Discord value bet post.")
         return
-    if not value_bets:
+    if not value_bets_by_game:
         logging.info("No value bets to send to Discord.")
         return
-    content = "**Value Bets**\n" + "\n".join(f"- {bet}" for bet in value_bets)
+    lines = ["@playbook **Value Bets**"]
+    for game_key, bets in value_bets_by_game.items():
+        lines.append(f"\n**{game_key}**")
+        lines.extend(f"- {bet}" for bet in bets)
+    content = "\n".join(lines)
     try:
         response = requests.post(DISCORD_WEBHOOK_URL, json={"content": content}, timeout=10)
         if response.status_code >= 400:
@@ -2047,7 +2051,7 @@ def train_player_stats_model(player_stats_df, daily_player_gamelogs_df, injuries
 def print_game_and_player_predictions(merged_features, player_stats_df, player_model, features, targets, odds_dict,
                                       props_odds, thresholds, team_stats_df):
     console = Console()
-    value_bets_for_discord = []
+    value_bets_for_discord = {}
     summary_table = Table(title="Game Predictions Summary", show_header=True, header_style="bold green")
     summary_table.add_column("Game", justify="center")
     summary_table.add_column("Predicted Score", justify="center")
@@ -2084,6 +2088,7 @@ def print_game_and_player_predictions(merged_features, player_stats_df, player_m
         away_abbr = game.get("away_team_abbr")
         predicted_home_score = game.get("predicted_home_score")
         predicted_away_score = game.get("predicted_away_score")
+        game_key = f"{away_abbr} vs {home_abbr}"
         console.rule(f"[bold blue]Game: {away_abbr} vs {home_abbr}[/bold blue]")
         console.print(
             f"Predicted Score: [green]{home_abbr} {predicted_home_score:.1f}[/green] - [red]{away_abbr} {predicted_away_score:.1f}[/red]")
@@ -2138,13 +2143,13 @@ def print_game_and_player_predictions(merged_features, player_stats_df, player_m
                             if diff > 0:
                                 value_bets.append(
                                     f"{label_mapping.get(market)}: {pred_value:.2f} vs. {prop_line:.2f} - over")
-                                value_bets_for_discord.append(
+                                value_bets_for_discord.setdefault(game_key, []).append(
                                     format_playbook_bet(name, market, prop_line, "over")
                                 )
                             else:
                                 value_bets.append(
                                     f"{label_mapping.get(market)}: {pred_value:.2f} vs. {prop_line:.2f} - under")
-                                value_bets_for_discord.append(
+                                value_bets_for_discord.setdefault(game_key, []).append(
                                     format_playbook_bet(name, market, prop_line, "under")
                                 )
                 value_bet_str = "\n".join(value_bets) if value_bets else "-"
@@ -2154,8 +2159,10 @@ def print_game_and_player_predictions(merged_features, player_stats_df, player_m
             console.print(table)
         console.print("\n")
     if value_bets_for_discord:
-        unique_bets = list(dict.fromkeys(value_bets_for_discord))
-        send_discord_value_bets(unique_bets)
+        unique_bets_by_game = {
+            game: list(dict.fromkeys(bets)) for game, bets in value_bets_for_discord.items()
+        }
+        send_discord_value_bets(unique_bets_by_game)
 
 
 def add_rest_features(games_df, historical_games):
@@ -2354,7 +2361,7 @@ def train_player_stats_model_with_optuna(player_stats_df, daily_player_gamelogs_
 def print_game_and_player_predictions(merged_features, player_stats_df, player_model, features, targets, odds_dict,
                                       props_odds, thresholds, team_stats_df):
     console = Console()
-    value_bets_for_discord = []
+    value_bets_for_discord = {}
     summary_table = Table(title="Game Predictions Summary", show_header=True, header_style="bold green")
     summary_table.add_column("Game", justify="center")
     summary_table.add_column("Predicted Score", justify="center")
@@ -2391,6 +2398,7 @@ def print_game_and_player_predictions(merged_features, player_stats_df, player_m
         away_abbr = game.get("away_team_abbr")
         predicted_home_score = game.get("predicted_home_score")
         predicted_away_score = game.get("predicted_away_score")
+        game_key = f"{away_abbr} vs {home_abbr}"
         console.rule(f"[bold blue]Game: {away_abbr} vs {home_abbr}[/bold blue]")
         console.print(
             f"Predicted Score: [green]{home_abbr} {predicted_home_score:.1f}[/green] - [red]{away_abbr} {predicted_away_score:.1f}[/red]")
@@ -2445,13 +2453,13 @@ def print_game_and_player_predictions(merged_features, player_stats_df, player_m
                             if diff > 0:
                                 value_bets.append(
                                     f"{label_mapping.get(market)}: {pred_value:.2f} vs. {prop_line:.2f} - over")
-                                value_bets_for_discord.append(
+                                value_bets_for_discord.setdefault(game_key, []).append(
                                     format_playbook_bet(name, market, prop_line, "over")
                                 )
                             else:
                                 value_bets.append(
                                     f"{label_mapping.get(market)}: {pred_value:.2f} vs. {prop_line:.2f} - under")
-                                value_bets_for_discord.append(
+                                value_bets_for_discord.setdefault(game_key, []).append(
                                     format_playbook_bet(name, market, prop_line, "under")
                                 )
                 value_bet_str = "\n".join(value_bets) if value_bets else "-"
@@ -2461,8 +2469,10 @@ def print_game_and_player_predictions(merged_features, player_stats_df, player_m
             console.print(table)
         console.print("\n")
     if value_bets_for_discord:
-        unique_bets = list(dict.fromkeys(value_bets_for_discord))
-        send_discord_value_bets(unique_bets)
+        unique_bets_by_game = {
+            game: list(dict.fromkeys(bets)) for game, bets in value_bets_for_discord.items()
+        }
+        send_discord_value_bets(unique_bets_by_game)
 
 
 def add_rest_features(games_df, historical_games):

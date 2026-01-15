@@ -39,7 +39,7 @@ from sklearn.preprocessing import StandardScaler, RobustScaler
 pd.set_option('future.no_silent_downcasting', True)
 
 # Set up Optuna logging verbosity
-optuna.logging.set_verbosity(optuna.logging.INFO)
+optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 
 def optuna_logging_callback(study, trial):
@@ -71,6 +71,7 @@ HARD_CODED_PG_HOST = "localhost"
 HARD_CODED_PG_PORT = "5432"
 HARD_CODED_PG_DATABASE = "nba"
 API_CACHE_TTL_MINUTES = 60
+DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1461420766108319858/LenBk50YR1eS1isFMSOzE8gMWgSgBTSYmU4Ac1unf2SOo_kPSGk71afBqbBiQDuUZwD3"
 
 session = None
 api_cache_initialized = False
@@ -1244,6 +1245,32 @@ def send_email(subject, plain_body, to_email, html_body=None):
         logging.error("Failed to send email: %s", e)
 
 
+def format_playbook_bet(player_name: str, market: str, line: float, direction: str) -> str:
+    market_label = {
+        "player_points": "points",
+        "player_assists": "assists",
+        "player_rebounds": "rebounds",
+        "player_threes": "3s"
+    }.get(market, market)
+    return f"{player_name} {direction} {line} {market_label}"
+
+
+def send_discord_value_bets(value_bets):
+    if not DISCORD_WEBHOOK_URL:
+        logging.info("DISCORD_WEBHOOK_URL not set; skipping Discord value bet post.")
+        return
+    if not value_bets:
+        logging.info("No value bets to send to Discord.")
+        return
+    content = "**Value Bets**\n" + "\n".join(f"- {bet}" for bet in value_bets)
+    try:
+        response = requests.post(DISCORD_WEBHOOK_URL, json={"content": content}, timeout=10)
+        if response.status_code >= 400:
+            logging.error("Discord webhook failed: %s %s", response.status_code, response.text)
+    except Exception as exc:
+        logging.error("Failed to send Discord webhook: %s", exc)
+
+
 def get_teams_with_games(games_df, target_date):
     target_date = pd.to_datetime(target_date).date()
     scheduled_games = games_df[games_df["local_date"] == target_date]
@@ -2020,6 +2047,7 @@ def train_player_stats_model(player_stats_df, daily_player_gamelogs_df, injuries
 def print_game_and_player_predictions(merged_features, player_stats_df, player_model, features, targets, odds_dict,
                                       props_odds, thresholds, team_stats_df):
     console = Console()
+    value_bets_for_discord = []
     summary_table = Table(title="Game Predictions Summary", show_header=True, header_style="bold green")
     summary_table.add_column("Game", justify="center")
     summary_table.add_column("Predicted Score", justify="center")
@@ -2110,15 +2138,24 @@ def print_game_and_player_predictions(merged_features, player_stats_df, player_m
                             if diff > 0:
                                 value_bets.append(
                                     f"{label_mapping.get(market)}: {pred_value:.2f} vs. {prop_line:.2f} - over")
+                                value_bets_for_discord.append(
+                                    format_playbook_bet(name, market, prop_line, "over")
+                                )
                             else:
                                 value_bets.append(
                                     f"{label_mapping.get(market)}: {pred_value:.2f} vs. {prop_line:.2f} - under")
+                                value_bets_for_discord.append(
+                                    format_playbook_bet(name, market, prop_line, "under")
+                                )
                 value_bet_str = "\n".join(value_bets) if value_bets else "-"
                 table.add_row(name, f"{adjusted_points:.2f}", f"{fanduel_points}", f"{predicted_assists:.2f}",
                               f"{fanduel_assists}", f"{predicted_rebounds:.2f}", f"{fanduel_rebounds}",
                               f"{predicted_threes:.2f}", f"{fanduel_threes}", value_bet_str)
             console.print(table)
         console.print("\n")
+    if value_bets_for_discord:
+        unique_bets = list(dict.fromkeys(value_bets_for_discord))
+        send_discord_value_bets(unique_bets)
 
 
 def add_rest_features(games_df, historical_games):
@@ -2317,6 +2354,7 @@ def train_player_stats_model_with_optuna(player_stats_df, daily_player_gamelogs_
 def print_game_and_player_predictions(merged_features, player_stats_df, player_model, features, targets, odds_dict,
                                       props_odds, thresholds, team_stats_df):
     console = Console()
+    value_bets_for_discord = []
     summary_table = Table(title="Game Predictions Summary", show_header=True, header_style="bold green")
     summary_table.add_column("Game", justify="center")
     summary_table.add_column("Predicted Score", justify="center")
@@ -2407,15 +2445,24 @@ def print_game_and_player_predictions(merged_features, player_stats_df, player_m
                             if diff > 0:
                                 value_bets.append(
                                     f"{label_mapping.get(market)}: {pred_value:.2f} vs. {prop_line:.2f} - over")
+                                value_bets_for_discord.append(
+                                    format_playbook_bet(name, market, prop_line, "over")
+                                )
                             else:
                                 value_bets.append(
                                     f"{label_mapping.get(market)}: {pred_value:.2f} vs. {prop_line:.2f} - under")
+                                value_bets_for_discord.append(
+                                    format_playbook_bet(name, market, prop_line, "under")
+                                )
                 value_bet_str = "\n".join(value_bets) if value_bets else "-"
                 table.add_row(name, f"{adjusted_points:.2f}", f"{fanduel_points}", f"{predicted_assists:.2f}",
                               f"{fanduel_assists}", f"{predicted_rebounds:.2f}", f"{fanduel_rebounds}",
                               f"{predicted_threes:.2f}", f"{fanduel_threes}", value_bet_str)
             console.print(table)
         console.print("\n")
+    if value_bets_for_discord:
+        unique_bets = list(dict.fromkeys(value_bets_for_discord))
+        send_discord_value_bets(unique_bets)
 
 
 def add_rest_features(games_df, historical_games):

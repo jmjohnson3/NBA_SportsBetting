@@ -4,9 +4,13 @@ import asyncio
 import logging
 import math
 import json
+import hashlib
+import os
+import psycopg2
+import psycopg2.extras
 import io
 import time
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, date, timezone
 import pytz
 import requests
 import pandas as pd
@@ -45,6 +49,7 @@ def optuna_logging_callback(study, trial):
 
 from optuna.study import MaxTrialsCallback
 
+
 # -------------------------------
 # Constants and API Configuration
 # -------------------------------
@@ -59,6 +64,134 @@ DATE_FORMAT = "iso"
 ODDS_BASE_URL = "https://api.the-odds-api.com/v4/sports"
 seasons = ["2023-2024", "2024-2025", "2025-2026"]
 TODAY = datetime.now(pytz.timezone("US/Eastern")).date()
+TARGET_DATE = TODAY
+HARD_CODED_PG_USER = "josh"
+HARD_CODED_PG_PASSWORD = "password"
+HARD_CODED_PG_HOST = "localhost"
+HARD_CODED_PG_PORT = "5432"
+HARD_CODED_PG_DATABASE = "nba"
+API_CACHE_TTL_MINUTES = 60
+
+session = None
+api_cache_initialized = False
+
+
+def get_db_connection():
+    try:
+        conn = psycopg2.connect(
+            user=HARD_CODED_PG_USER,
+            password=HARD_CODED_PG_PASSWORD,
+            host=HARD_CODED_PG_HOST,
+            port=HARD_CODED_PG_PORT,
+            dbname=HARD_CODED_PG_DATABASE,
+            connect_timeout=5
+        )
+    except psycopg2.OperationalError as exc:
+        logging.error("Postgres connection failed: %s", exc)
+        raise
+    conn.autocommit = True
+    return conn
+
+
+def init_api_cache() -> None:
+    global api_cache_initialized
+    if api_cache_initialized:
+        return
+    try:
+        conn = get_db_connection()
+    except psycopg2.OperationalError as exc:
+        raise RuntimeError(
+            "Postgres is required for API caching. Start the database or update the connection settings."
+        ) from exc
+    with conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS api_cache (
+                    id SERIAL PRIMARY KEY,
+                    url TEXT NOT NULL,
+                    response_json JSONB NOT NULL,
+                    response_hash TEXT NOT NULL,
+                    fetched_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_api_cache_url_fetched_at
+                ON api_cache(url, fetched_at DESC)
+                """
+            )
+            cursor.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_api_cache_url_hash
+                ON api_cache(url, response_hash)
+                """
+            )
+    api_cache_initialized = True
+
+
+def _serialize_json(payload: dict) -> str:
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def _hash_json(serialized: str) -> str:
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def get_cached_response(url: str):
+    conn = get_db_connection()
+    with conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cursor:
+            cursor.execute(
+                """
+                SELECT response_json, fetched_at
+                FROM api_cache
+                WHERE url = %s
+                ORDER BY fetched_at DESC, id DESC
+                LIMIT 1
+                """,
+                (url,)
+            )
+            row = cursor.fetchone()
+    if not row:
+        return None, None
+    return row["response_json"], row["fetched_at"]
+
+
+def cache_response(url: str, payload: dict) -> bool:
+    serialized = _serialize_json(payload)
+    response_hash = _hash_json(serialized)
+    conn = get_db_connection()
+    with conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO api_cache (url, response_json, response_hash, fetched_at)
+                VALUES (%s, %s, %s, NOW())
+                ON CONFLICT (url, response_hash) DO NOTHING
+                """,
+                (url, psycopg2.extras.Json(payload), response_hash)
+            )
+            return cursor.rowcount > 0
+
+
+def is_cache_fresh(fetched_at, ttl_minutes: int) -> bool:
+    if not fetched_at:
+        return False
+    cached_time = fetched_at
+    if cached_time.tzinfo is None:
+        cached_time = cached_time.replace(tzinfo=timezone.utc)
+    return datetime.now(timezone.utc) - cached_time < timedelta(minutes=ttl_minutes)
+
+
+def get_http_session() -> requests.Session:
+    global session
+    if session is None:
+        session = requests.Session()
+        session.auth = HTTPBasicAuth(API_USERNAME, API_PASSWORD)
+    return session
+
 
 endpoints = {
     "seasonal_games": "https://api.mysportsfeeds.com/v2.1/pull/nba/{season}-regular/games.json",
@@ -412,10 +545,11 @@ def train_autokeras_game_model(X, y, max_trials=3, epochs=50):
 # NEW: Reinforcement Learning (RL) for Dynamic Betting Adjustment
 # -------------------------------
 try:
-    import gym
-    from gym import spaces
+    os.environ.setdefault("GYM_DISABLE_WARNINGS", "1")
+    import gymnasium as gym
+    from gymnasium import spaces
 except ImportError:
-    print("gym is not installed. Please install with: pip install gym")
+    print("Gymnasium is not installed. Please install with: pip install gymnasium")
     gym = None
 
 try:
@@ -584,26 +718,17 @@ def deduplicate_player_stats(player_stats_df, players_data):
     return dedup_df
 
 
-async def async_fetch_api_data(url: str) -> dict:
-    async with aiohttp.ClientSession(auth=aiohttp.BasicAuth(API_USERNAME, API_PASSWORD)) as session:
-        async with session.get(url) as response:
-            response.raise_for_status()
-            return await response.json()
+async def async_fetch_api_data(url: str, refresh: bool = False) -> dict:
+    return await asyncio.to_thread(fetch_api_data, url, refresh=refresh)
+
 
 
 def fetch_games_data(api_url: str) -> dict:
     logger = logging.getLogger(__name__)
-    try:
-        response = requests.get(api_url, auth=(API_USERNAME, API_PASSWORD))
-        response.raise_for_status()
-    except requests.RequestException as e:
-        logger.error("Error fetching games data from %s: %s", api_url, e)
-        raise
-    try:
-        data = response.json()
-    except Exception as e:
-        logger.error("Error parsing games JSON: %s", e)
-        raise
+    data = fetch_api_data(api_url)
+    if data is None:
+        logger.error("No data returned for games endpoint %s", api_url)
+        raise ValueError("No data returned for games endpoint")
     if "games" not in data:
         logger.error("The JSON data does not contain a 'games' key.")
         raise ValueError("Invalid JSON structure for games: missing 'games' key")
@@ -637,17 +762,10 @@ def flatten_games_data(api_url: str) -> pd.DataFrame:
 
 def fetch_venues_data(api_url: str) -> dict:
     logger = logging.getLogger(__name__)
-    try:
-        response = requests.get(api_url, auth=(API_USERNAME, API_PASSWORD))
-        response.raise_for_status()
-    except requests.RequestException as e:
-        logger.error("Error fetching venues data from %s: %s", api_url, e)
-        raise
-    try:
-        data = response.json()
-    except Exception as e:
-        logger.error("Error parsing venues JSON: %s", e)
-        raise
+    data = fetch_api_data(api_url)
+    if data is None:
+        logger.error("No data returned for venues endpoint %s", api_url)
+        raise ValueError("No data returned for venues endpoint")
     if "venues" not in data:
         logger.error("The JSON data does not contain a 'venues' key.")
         raise ValueError("Invalid JSON structure for venues: missing 'venues' key")
@@ -1289,15 +1407,31 @@ def process_injuries(injuries_data):
     return df_injuries
 
 
-def fetch_api_data(url, max_retries=3):
+def fetch_api_data(url, max_retries=3, refresh=False, cache_ttl_minutes=API_CACHE_TTL_MINUTES):
+    init_api_cache()
+    cached_data = None
+    cached_at = None
+    cached_data, cached_at = get_cached_response(url)
+    if cached_data is not None and not refresh:
+        if cache_ttl_minutes is None or is_cache_fresh(cached_at, cache_ttl_minutes):
+            return cached_data
+    session = get_http_session()
     for attempt in range(max_retries):
         try:
             response = session.get(url)
             if response.status_code == 200:
-                return response.json()
+                payload = response.json()
+                inserted = cache_response(url, payload)
+                if inserted:
+                    logging.info("Cached new API response for %s", url)
+                return payload
             elif response.status_code == 204:
                 logging.warning("Received 204 (No Content) from %s", url)
-                return {}
+                payload = {}
+                inserted = cache_response(url, payload)
+                if inserted:
+                    logging.info("Cached empty API response for %s", url)
+                return cached_data or payload
             elif response.status_code == 429:
                 retry_after = int(response.headers.get("Retry-After", 2))
                 time.sleep(retry_after)
@@ -1307,7 +1441,8 @@ def fetch_api_data(url, max_retries=3):
         except Exception:
             logging.exception("Exception occurred while fetching data from %s", url)
             break
-    return None
+    return cached_data
+
 
 
 def get_local_game_date(start_time, tz="US/Eastern"):
@@ -1500,14 +1635,14 @@ def fetch_season_data(season):
     return data
 
 
-def fetch_game_details(season, game):
+def fetch_game_details(season, game, target_date=TARGET_DATE):
     details = {}
     game_info = game.get("schedule", game)
     start_time = game_info.get("startTime")
     if not start_time:
         return details
-    game_date = parser.isoparse(start_time).date()
-    if game_date > date.today():
+    local_game_date = parser.isoparse(start_time).astimezone(pytz.timezone("US/Eastern")).date()
+    if local_game_date != target_date:
         return details
     date_str = get_local_game_date(start_time, tz="US/Eastern")
     away_team = game_info.get("awayTeam", {}).get("abbreviation") or game_info.get("awayTeamAbbreviation")
@@ -1551,8 +1686,9 @@ def ingest_data():
             game_id = game.get("id") or game.get("schedule", {}).get("id")
             if game_id:
                 game_id = str(game_id)
-                details = fetch_game_details(season, game)
-                game_details_for_season[game_id] = details
+                details = fetch_game_details(season, game, target_date=TARGET_DATE)
+                if details:
+                    game_details_for_season[game_id] = details
         all_games_details[season] = game_details_for_season
     print("Ingested all season data.")
     return current_season_data, players_data, injuries_data, all_season_data, all_games_details
@@ -2000,7 +2136,7 @@ def add_rest_features(games_df, historical_games):
                         extract_abbr(row.get("awayTeam")) == team_abbr), axis=1)]
         if not team_games.empty:
             last_date = team_games["local_date"].max()
-            return (TODAY - last_date).days
+            return (TARGET_DATE - last_date).days
         return None
 
     games_df["home_team_days_rest"] = games_df["home_team_abbr"].apply(lambda abbr: days_rest_for_team(abbr))
@@ -2297,7 +2433,7 @@ def add_rest_features(games_df, historical_games):
                         extract_abbr(row.get("awayTeam")) == team_abbr), axis=1)]
         if not team_games.empty:
             last_date = team_games["local_date"].max()
-            return (TODAY - last_date).days
+            return (TARGET_DATE - last_date).days
         return None
 
     games_df["home_team_days_rest"] = games_df["home_team_abbr"].apply(lambda abbr: days_rest_for_team(abbr))
@@ -2385,6 +2521,7 @@ def main():
         print("Deduplicated parsed games dataframe shape:", games_df.shape)
 
     print("Games parsed shape:", games_df.shape)
+    games_df["local_date"] = pd.to_datetime(games_df["local_date"]).dt.date
     player_stats_df = deduplicate_player_stats(player_stats_df, players_data)
     print("Deduplicated player stats dataframe shape:", player_stats_df.shape)
     player_stats_df = override_team_info(player_stats_df, players_data)
@@ -2392,18 +2529,18 @@ def main():
 
     boxscore_df, playbyplay_df = parse_detailed_game_data(all_games_details)
     TEAM_LOCATIONS = get_team_locations(venues_df)
-    teams_with_games = get_teams_with_games(games_df, TODAY)
-    print("Teams with games on", TODAY, ":", teams_with_games)
-    daily_player_gamelogs = fetch_daily_player_gamelogs_for_teams(seasons[-1], TODAY, teams_with_games)
+    teams_with_games = get_teams_with_games(games_df, TARGET_DATE)
+    print("Teams with games on", TARGET_DATE, ":", teams_with_games)
+    daily_player_gamelogs = fetch_daily_player_gamelogs_for_teams(seasons[-1], TARGET_DATE, teams_with_games)
     if daily_player_gamelogs.empty:
-        print("No daily player gamelog data available for TODAY.")
+        print("No daily player gamelog data available for TARGET_DATE.")
 
     # Separate historical games and today's games.
-    historical_games = games_df[games_df["local_date"] < TODAY].copy()
-    todays_games = games_df[games_df["local_date"] == TODAY].copy()
+    historical_games = games_df[games_df["local_date"] < TARGET_DATE].copy()
+    todays_games = games_df[games_df["local_date"] == TARGET_DATE].copy()
     print(f"Total games ingested: {games_df.shape[0]}")
     print(f"Historical games (for training): {historical_games.shape}")
-    print(f"Today's games (for prediction): {todays_games.shape}")
+    print(f"Target date games (for prediction): {todays_games.shape}")
 
     # ---
     # INSERTED IMPROVEMENTS: Enhanced feature engineering for historical games.
@@ -2421,11 +2558,11 @@ def main():
     if "stats" in team_stats_df.columns:
         team_stats_flat = pd.json_normalize(team_stats_df["stats"]).add_prefix("stats_")
         team_stats_df = pd.concat([team_stats_df.drop(columns=["stats"]), team_stats_flat], axis=1)
-    historical_games = games_df[games_df["local_date"] < TODAY].copy()
-    todays_games = games_df[games_df["local_date"] == TODAY].copy()
+    historical_games = games_df[games_df["local_date"] < TARGET_DATE].copy()
+    todays_games = games_df[games_df["local_date"] == TARGET_DATE].copy()
     print(f"Total games ingested: {games_df.shape[0]}")
     print(f"Historical games (for training): {historical_games.shape}")
-    print(f"Today's games (for prediction): {todays_games.shape}")
+    print(f"Target date games (for prediction): {todays_games.shape}")
     todays_games = add_rest_features(todays_games, historical_games)
     todays_games = add_schedule_congestion(todays_games, window_days=7)
     todays_games = add_travel_distance_feature(todays_games, TEAM_LOCATIONS, historical_games)
@@ -2518,7 +2655,7 @@ def main():
         lambda x: x.get("abbreviation").upper().strip() if isinstance(x, dict) else str(x).upper().strip())
     games_df["away_team_abbr"] = games_df["awayTeam"].apply(
         lambda x: x.get("abbreviation").upper().strip() if isinstance(x, dict) else str(x).upper().strip())
-    games_today_df = games_df[games_df['local_date'] == pd.Timestamp(TODAY)]
+    games_today_df = games_df[games_df['local_date'] == TARGET_DATE]
     print("games_today_df shape:", games_today_df.shape)
     nba_odds = get_nba_odds()
     player_model, player_stats_ready_df, feat_cols, target_cols = train_player_stats_model_with_optuna(
@@ -2552,6 +2689,6 @@ def main():
 
 
 if __name__ == '__main__':
-    session = requests.Session()
-    session.auth = HTTPBasicAuth(API_USERNAME, API_PASSWORD)
+    init_api_cache()
+    get_http_session()
     main()

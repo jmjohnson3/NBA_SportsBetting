@@ -1262,15 +1262,15 @@ def send_discord_value_bets(value_bets_by_game):
     if not value_bets_by_game:
         logging.info("No value bets to send to Discord.")
         return
-    lines = ["@playbook **Value Bets**"]
-    for game_key, bets in value_bets_by_game.items():
-        lines.append(f"\n**{game_key}**")
-        lines.extend(f"- {bet}" for bet in bets)
-    content = "\n".join(lines)
     try:
-        response = requests.post(DISCORD_WEBHOOK_URL, json={"content": content}, timeout=10)
-        if response.status_code >= 400:
-            logging.error("Discord webhook failed: %s %s", response.status_code, response.text)
+        for game_key, bets in value_bets_by_game.items():
+            lines = [f"@playbook **{game_key}**"]
+            lines.extend(f"- {bet}" for bet in bets)
+            content = "\n".join(lines)
+            response = requests.post(DISCORD_WEBHOOK_URL, json={"content": content}, timeout=10)
+            if response.status_code >= 400:
+                logging.error("Discord webhook failed for %s: %s %s", game_key, response.status_code,
+                              response.text)
     except Exception as exc:
         logging.error("Failed to send Discord webhook: %s", exc)
 

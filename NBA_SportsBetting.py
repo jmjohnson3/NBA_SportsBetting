@@ -73,7 +73,8 @@ HARD_CODED_PG_DATABASE = "nba"
 API_CACHE_TTL_MINUTES = 60
 DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1461420766108319858/LenBk50YR1eS1isFMSOzE8gMWgSgBTSYmU4Ac1unf2SOo_kPSGk71afBqbBiQDuUZwD3"
 DISCORD_WEBHOOK_DELAY_SECONDS = 30
-PLAYBOOK_MENTION = "@Playbook"
+PLAYBOOK_ROLE_ID = "1461416310654107808"
+PLAYBOOK_MENTION = f"<@&{PLAYBOOK_ROLE_ID}>"
 
 session = None
 api_cache_initialized = False
@@ -1275,7 +1276,7 @@ def send_discord_value_bets(value_bets_by_game):
                 DISCORD_WEBHOOK_URL,
                 json={
                     "content": content,
-                    "allowed_mentions": {"parse": ["users", "roles", "everyone"]}
+                    "allowed_mentions": {"roles": [PLAYBOOK_ROLE_ID], "parse": []}
                 },
                 timeout=10
             )

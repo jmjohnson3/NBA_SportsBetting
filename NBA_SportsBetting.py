@@ -1264,7 +1264,9 @@ def send_discord_value_bets(value_bets_by_game):
         return
     try:
         for game_key, bets in value_bets_by_game.items():
-            lines = [f"@playbook **{game_key}**"]
+            if not bets:
+                continue
+            lines = [f"@Playbook **{game_key}**"]
             lines.extend(f"- {bet}" for bet in bets)
             content = "\n".join(lines)
             response = requests.post(DISCORD_WEBHOOK_URL, json={"content": content}, timeout=10)

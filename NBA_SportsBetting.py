@@ -73,6 +73,7 @@ HARD_CODED_PG_DATABASE = "nba"
 API_CACHE_TTL_MINUTES = 60
 DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1461420766108319858/LenBk50YR1eS1isFMSOzE8gMWgSgBTSYmU4Ac1unf2SOo_kPSGk71afBqbBiQDuUZwD3"
 DISCORD_WEBHOOK_DELAY_SECONDS = 30
+PLAYBOOK_MENTION = "@Playbook"
 
 session = None
 api_cache_initialized = False
@@ -1267,10 +1268,17 @@ def send_discord_value_bets(value_bets_by_game):
         for game_key, bets in value_bets_by_game.items():
             if not bets:
                 continue
-            lines = [f"@Playbook **{game_key}**"]
+            lines = [f"{PLAYBOOK_MENTION} **{game_key}**"]
             lines.extend(f"- {bet}" for bet in bets)
             content = "\n".join(lines)
-            response = requests.post(DISCORD_WEBHOOK_URL, json={"content": content}, timeout=10)
+            response = requests.post(
+                DISCORD_WEBHOOK_URL,
+                json={
+                    "content": content,
+                    "allowed_mentions": {"parse": ["users", "roles", "everyone"]}
+                },
+                timeout=10
+            )
             if response.status_code >= 400:
                 logging.error("Discord webhook failed for %s: %s %s", game_key, response.status_code,
                               response.text)

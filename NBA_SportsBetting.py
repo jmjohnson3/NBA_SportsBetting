@@ -72,6 +72,7 @@ HARD_CODED_PG_PORT = "5432"
 HARD_CODED_PG_DATABASE = "nba"
 API_CACHE_TTL_MINUTES = 60
 DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1461420766108319858/LenBk50YR1eS1isFMSOzE8gMWgSgBTSYmU4Ac1unf2SOo_kPSGk71afBqbBiQDuUZwD3"
+DISCORD_WEBHOOK_DELAY_SECONDS = 30
 
 session = None
 api_cache_initialized = False
@@ -1273,6 +1274,7 @@ def send_discord_value_bets(value_bets_by_game):
             if response.status_code >= 400:
                 logging.error("Discord webhook failed for %s: %s %s", game_key, response.status_code,
                               response.text)
+            time.sleep(DISCORD_WEBHOOK_DELAY_SECONDS)
     except Exception as exc:
         logging.error("Failed to send Discord webhook: %s", exc)
 

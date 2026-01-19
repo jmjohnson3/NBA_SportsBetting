@@ -73,8 +73,10 @@ HARD_CODED_PG_DATABASE = "nba"
 API_CACHE_TTL_MINUTES = 60
 DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1461420766108319858/LenBk50YR1eS1isFMSOzE8gMWgSgBTSYmU4Ac1unf2SOo_kPSGk71afBqbBiQDuUZwD3"
 DISCORD_WEBHOOK_DELAY_SECONDS = 30
-PLAYBOOK_ROLE_ID = "1461416310654107808"
-PLAYBOOK_MENTION = f"<@&{PLAYBOOK_ROLE_ID}>"
+PLAYBOOK_USER_ID = "1408438245594763375"
+PLAYBOOK_MENTION = f"<@!{PLAYBOOK_USER_ID}>"
+DISCORD_BOT_TOKEN = "MTM4MDYyMzgxMzQyNzA3MzA5NQ.GAoVyL.3_TfETbDKOlqUGEYhLOE3GI6nYljZxflTENE2w"
+DISCORD_CHANNEL_ID = "1461420980260831253"
 
 session = None
 api_cache_initialized = False
@@ -1259,13 +1261,14 @@ def format_playbook_bet(player_name: str, market: str, line: float, direction: s
 
 
 def send_discord_value_bets(value_bets_by_game):
-    if not DISCORD_WEBHOOK_URL:
-        logging.info("DISCORD_WEBHOOK_URL not set; skipping Discord value bet post.")
+    if not DISCORD_BOT_TOKEN or not DISCORD_CHANNEL_ID:
+        logging.info("DISCORD_BOT_TOKEN or DISCORD_CHANNEL_ID not set; skipping Discord value bet post.")
         return
     if not value_bets_by_game:
         logging.info("No value bets to send to Discord.")
         return
     try:
+        headers = {"Authorization": f"Bot {DISCORD_BOT_TOKEN}"}
         for game_key, bets in value_bets_by_game.items():
             if not bets:
                 continue
@@ -1273,19 +1276,20 @@ def send_discord_value_bets(value_bets_by_game):
             lines.extend(f"- {bet}" for bet in bets)
             content = "\n".join(lines)
             response = requests.post(
-                DISCORD_WEBHOOK_URL,
+                f"https://discord.com/api/v10/channels/{DISCORD_CHANNEL_ID}/messages",
+                headers = headers,
                 json={
                     "content": content,
-                    "allowed_mentions": {"roles": [PLAYBOOK_ROLE_ID], "parse": []}
+                    "allowed_mentions": {"users": [PLAYBOOK_USER_ID]}
                 },
                 timeout=10
             )
             if response.status_code >= 400:
-                logging.error("Discord webhook failed for %s: %s %s", game_key, response.status_code,
+                logging.error("Discord post failed for %s: %s %s", game_key, response.status_code,
                               response.text)
             time.sleep(DISCORD_WEBHOOK_DELAY_SECONDS)
     except Exception as exc:
-        logging.error("Failed to send Discord webhook: %s", exc)
+        logging.error("Failed to send Discord message: %s", exc)
 
 
 def get_teams_with_games(games_df, target_date):

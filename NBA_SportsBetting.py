@@ -1179,6 +1179,11 @@ def format_playbook_bet(player_name: str, market: str, line: float, direction: s
     return f"{player_name} {direction} {line} {market_label}"
 
 
+def format_hit_rate_bet(player_name: str, market: str, line: float, direction: str, window: int) -> str:
+    base = format_playbook_bet(player_name, market, line, direction)
+    return f"{base} (last {window}: {window}/{window})"
+
+
 def send_discord_value_bets(value_bets_by_game):
     if not DISCORD_BOT_TOKEN or not DISCORD_CHANNEL_ID:
         logging.info("DISCORD_BOT_TOKEN or DISCORD_CHANNEL_ID not set; skipping Discord value bet post.")
@@ -1211,6 +1216,65 @@ def send_discord_value_bets(value_bets_by_game):
         logging.error("Failed to send Discord message: %s", exc)
 
 
+def send_discord_hit_rate_bets(hit_rate_bets_by_game, window: int = 5):
+    if not DISCORD_BOT_TOKEN or not DISCORD_CHANNEL_ID:
+        logging.info("DISCORD_BOT_TOKEN or DISCORD_CHANNEL_ID not set; skipping Discord hit rate post.")
+        return
+    if not hit_rate_bets_by_game:
+        logging.info("No hit rate bets to send to Discord.")
+        return
+    try:
+        headers = {"Authorization": f"Bot {DISCORD_BOT_TOKEN}"}
+        for game_key, bets in hit_rate_bets_by_game.items():
+            if not bets:
+                continue
+            lines = [
+                f"{PLAYBOOK_MENTION} **{game_key}**",
+                f"100% hit rate over last {window} games:"
+            ]
+            lines.extend(f"- {bet}" for bet in bets)
+            content = "\n".join(lines)
+            response = requests.post(
+                f"https://discord.com/api/v10/channels/{DISCORD_CHANNEL_ID}/messages",
+                headers=headers,
+                json={
+                    "content": content,
+                    "allowed_mentions": {"users": [PLAYBOOK_USER_ID]}
+                },
+                timeout=10
+            )
+            if response.status_code >= 400:
+                logging.error("Discord hit rate post failed for %s: %s %s", game_key, response.status_code,
+                              response.text)
+            time.sleep(DISCORD_WEBHOOK_DELAY_SECONDS)
+    except Exception as exc:
+        logging.error("Failed to send Discord hit rate message: %s", exc)
+
+
+def print_hit_rate_bets(hit_rate_bets, window: int = 5):
+    console = Console()
+    if not hit_rate_bets:
+        console.print(f"[yellow]No 100% hit rate bets found over the last {window} games.[/yellow]")
+        return
+    table = Table(title=f"100% Hit Rate Bets (Last {window} Games)", show_header=True, header_style="bold magenta")
+    table.add_column("Game", style="white", no_wrap=True)
+    table.add_column("Player", style="white", no_wrap=True)
+    table.add_column("Market", style="cyan")
+    table.add_column("Line", justify="right")
+    table.add_column("Direction", style="green")
+    table.add_column(f"Last {window}", justify="center")
+    for bet in hit_rate_bets:
+        table.add_row(
+            bet["game"],
+            bet["player"],
+            bet["market"],
+            f"{bet['line']:.2f}",
+            bet["direction"],
+            f"{window}/{window}"
+        )
+    console.print(table)
+
+
 def get_teams_with_games(games_df, target_date):
     target_date = pd.to_datetime(target_date).date()
     scheduled_games = games_df[games_df["local_date"] == target_date]
@@ -1228,6 +1292,148 @@ def get_teams_with_games(games_df, target_date):
             teams.add(away_abbr)
     print("Teams with games on", target_date, ":", teams)
     return list(teams)
+
+
+def fetch_seasonal_player_gamelogs_for_teams(season, teams):
+    print("Fetching seasonal player gamelogs for teams:", teams)
+    all_gamelogs = []
+    for team in teams:
+        url = endpoints["seasonal_player_gamelogs"].format(season=season, team_abbr=team)
+        data = fetch_api_data(url)
+        if data and isinstance(data, dict) and "gamelogs" in data:
+            if data["gamelogs"]:
+                all_gamelogs.extend(data["gamelogs"])
+            else:
+                print(f"No gamelogs found for team {team}")
+        else:
+            print(f"No gamelog data returned for team {team}")
+    df_logs = pd.DataFrame(all_gamelogs)
+    print("Seasonal player gamelogs loaded. Shape:", df_logs.shape)
+    return df_logs
+
+
+def compute_perfect_hit_rate_bets(player_gamelogs_df, props_odds, games_today_df, window: int = 5):
+    if player_gamelogs_df.empty:
+        logging.info("No player gamelogs available for hit rate evaluation.")
+        return [], {}
+    if not props_odds:
+        logging.info("No props odds available for hit rate evaluation.")
+        return [], {}
+    df = player_gamelogs_df.copy()
+    if "stats" in df.columns and df["stats"].apply(lambda x: isinstance(x, dict)).all():
+        stats_flat = pd.json_normalize(df["stats"])
+        stats_flat.columns = [f"stats_{col}" for col in stats_flat.columns]
+        df = pd.concat([df.drop(columns=["stats"]), stats_flat], axis=1)
+
+    def select_col(*possible_keys):
+        for key in possible_keys:
+            if key in df.columns:
+                return key
+        return None
+
+    pts_col = select_col("stats_offense.pts", "stats_offense.ptsPerGame", "pts")
+    ast_col = select_col("stats_offense.ast", "stats_offense.astPerGame", "ast")
+    reb_col = select_col("stats_rebounds.reb", "stats_rebounds.rebPerGame", "reb")
+    market_cols = {
+        "player_points": pts_col,
+        "player_assists": ast_col,
+        "player_rebounds": reb_col
+    }
+    if any(col is None for col in market_cols.values()):
+        missing = [market for market, col in market_cols.items() if col is None]
+        logging.warning("Missing columns for hit rate evaluation: %s", missing)
+        return [], {}
+
+    if "player_id" not in df.columns:
+        if "player" in df.columns:
+            df["player_id"] = df["player"].apply(lambda x: x.get("id") if isinstance(x, dict) else None)
+        elif "player.id" in df.columns:
+            df["player_id"] = df["player.id"]
+    if "game.startTime" in df.columns:
+        df["game_date"] = pd.to_datetime(df["game.startTime"], errors="coerce")
+    elif "game_startTime" in df.columns:
+        df["game_date"] = pd.to_datetime(df["game_startTime"], errors="coerce")
+    else:
+        df["game_date"] = pd.NaT
+
+    def extract_team_abbr(row):
+        for key in ["teamAbbreviation", "team.abbreviation", "team_abbreviation", "team.abbr", "teamAbbr", "team_abbr"]:
+            if key in df.columns and row.get(key):
+                return row.get(key)
+        team = row.get("team")
+        if isinstance(team, dict):
+            return team.get("abbreviation")
+        return None
+
+    df["team_abbr"] = df.apply(extract_team_abbr, axis=1)
+    df["team_abbr"] = df["team_abbr"].apply(lambda x: str(x).upper().strip() if pd.notna(x) else None)
+
+    game_lookup = {}
+    for _, game in games_today_df.iterrows():
+        home_abbr = game.get("home_team_abbr")
+        away_abbr = game.get("away_team_abbr")
+        if not home_abbr or not away_abbr:
+            home_team = game.get("homeTeam")
+            away_team = game.get("awayTeam")
+            home_abbr = home_team.get("abbreviation") if isinstance(home_team, dict) else home_team
+            away_abbr = away_team.get("abbreviation") if isinstance(away_team, dict) else away_team
+        if home_abbr and away_abbr:
+            game_key = f"{away_abbr} vs {home_abbr}"
+            game_lookup[str(home_abbr).upper().strip()] = game_key
+            game_lookup[str(away_abbr).upper().strip()] = game_key
+
+    def parse_prop_line(value):
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    hit_rate_bets = []
+    hit_rate_bets_by_game = {}
+    for player_id, group in df.groupby("player_id"):
+        group = group.dropna(subset=["game_date"])
+        if group.empty:
+            continue
+        group = group.sort_values("game_date", ascending=False)
+        last_games = group.head(window)
+        if len(last_games) < window:
+            continue
+        player_info = last_games.iloc[0].get("player")
+        if isinstance(player_info, dict):
+            player_name = f"{player_info.get('firstName', '')} {player_info.get('lastName', '')}".strip()
+        else:
+            player_name = str(player_info).strip()
+        if not player_name:
+            continue
+        player_name_upper = player_name.upper().strip()
+        team_abbr = last_games["team_abbr"].dropna().iloc[0] if last_games["team_abbr"].notna().any() else None
+        if not team_abbr or team_abbr not in game_lookup:
+            continue
+        game_key = game_lookup[team_abbr]
+        for market, stat_col in market_cols.items():
+            prop_line = parse_prop_line(props_odds.get(f"{player_name_upper}_{market}"))
+            if prop_line is None:
+                continue
+            stat_values = pd.to_numeric(last_games[stat_col], errors="coerce")
+            if stat_values.isna().any():
+                continue
+            direction = None
+            if (stat_values >= prop_line).all():
+                direction = "over"
+            elif (stat_values <= prop_line).all():
+                direction = "under"
+            if direction:
+                hit_rate_bets.append({
+                    "game": game_key,
+                    "player": player_name,
+                    "market": market.replace("player_", "").replace("_", " ").title(),
+                    "line": prop_line,
+                    "direction": direction
+                })
+                hit_rate_bets_by_game.setdefault(game_key, []).append(
+                    format_hit_rate_bet(player_name, market, prop_line, direction, window)
+                )
+    return hit_rate_bets, hit_rate_bets_by_game
 
 
 # Modify get_nba_odds to include real odds
@@ -2527,6 +2733,9 @@ def main():
     daily_player_gamelogs = fetch_daily_player_gamelogs_for_teams(seasons[-1], TARGET_DATE, teams_with_games)
     if daily_player_gamelogs.empty:
         print("No daily player gamelog data available for TARGET_DATE.")
+    seasonal_player_gamelogs = fetch_seasonal_player_gamelogs_for_teams(seasons[-1], teams_with_games)
+    if seasonal_player_gamelogs.empty:
+        print("No seasonal player gamelog data available for hit rate bets.")
 
     # Separate historical games and today's games.
     historical_games = games_df[games_df["local_date"] < TARGET_DATE].copy()
@@ -2672,6 +2881,15 @@ def main():
     global props_odds
     props_odds = get_all_player_props_odds(nba_odds)
     thresholds = {"player_points": 3.5, "player_assists": 2.5, "player_rebounds": 2.5, "player_threes": 2.5}
+    hit_rate_bets, hit_rate_bets_by_game = compute_perfect_hit_rate_bets(
+        seasonal_player_gamelogs,
+        props_odds,
+        games_today_df,
+        window=5
+    )
+    print_hit_rate_bets(hit_rate_bets, window=5)
+    if hit_rate_bets_by_game:
+        send_discord_hit_rate_bets(hit_rate_bets_by_game, window=5)
     print_game_and_player_predictions(merged_features_today, player_stats_ready_df, player_model, feat_cols,
                                       target_cols, nba_odds, props_odds, thresholds, team_stats_df)
     build_html_predictions(merged_features_today, player_stats_ready_df, player_model, feat_cols, target_cols,

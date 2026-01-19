@@ -1201,7 +1201,14 @@ def normalize_team_abbr(team_abbr: str) -> str:
         return team_abbr
     normalized = team_abbr.upper().strip()
     return {
-        "BRO": "BKN"
+        "BRO": "BKN",
+        "OKL": "OKC",
+        "OKC": "OKC",
+        "PHO": "PHX",
+        "NJN": "BKN",
+        "NOH": "NOP",
+        "NOK": "NOP",
+        "WSH": "WAS"
     }.get(normalized, normalized)
 
 
@@ -1371,13 +1378,16 @@ def fetch_seasonal_player_gamelogs_for_teams(season, teams):
     return df_logs
 
 
-def compute_perfect_hit_rate_bets(player_gamelogs_df, props_odds, games_today_df, window: int = 5):
+def compute_perfect_hit_rate_bets(player_gamelogs_df, props_odds, games_today_df, window: int = 5,
+                                  player_team_map=None):
     if player_gamelogs_df.empty:
         logging.info("No player gamelogs available for hit rate evaluation.")
-        return [], {}
+        return [], {}, [], {}
     if not props_odds:
         logging.info("No props odds available for hit rate evaluation.")
-        return [], {}
+        return [], {}, [], {}
+    if player_team_map is None:
+        player_team_map = {}
     normalized_props = {}
     for key, value in props_odds.items():
         if not key:
@@ -1413,7 +1423,7 @@ def compute_perfect_hit_rate_bets(player_gamelogs_df, props_odds, games_today_df
     if any(col is None for col in market_cols.values()):
         missing = [market for market, col in market_cols.items() if col is None]
         logging.warning("Missing columns for hit rate evaluation: %s", missing)
-        return [], {}
+        return [], {}, [], {}
 
     if "player_id" not in df.columns:
         if "player" in df.columns:
@@ -1480,6 +1490,10 @@ def compute_perfect_hit_rate_bets(player_gamelogs_df, props_odds, games_today_df
             continue
         player_name_upper = normalize_player_name(player_name)
         team_abbr = last_games["team_abbr"].dropna().iloc[0] if last_games["team_abbr"].notna().any() else None
+        team_abbr = normalize_team_abbr(team_abbr) if team_abbr else None
+        if not team_abbr or team_abbr not in game_lookup:
+            mapped_team = player_team_map.get(player_name_upper)
+            team_abbr = normalize_team_abbr(mapped_team) if mapped_team else None
         if not team_abbr or team_abbr not in game_lookup:
             continue
         game_key = game_lookup[team_abbr]
@@ -2979,12 +2993,24 @@ def main():
     global props_odds
     props_odds = get_all_player_props_odds(nba_odds)
     thresholds = {"player_points": 3.5, "player_assists": 2.5, "player_rebounds": 2.5, "player_threes": 2.5}
+    player_team_map = {}
+    for _, row in player_stats_ready_df.iterrows():
+        player_info = row.get("player")
+        if isinstance(player_info, dict):
+            player_name = f"{player_info.get('firstName', '')} {player_info.get('lastName', '')}".strip()
+        else:
+            player_name = str(player_info).strip()
+        normalized_name = normalize_player_name(player_name)
+        team_abbr = row.get("team_abbr")
+        if normalized_name and team_abbr:
+            player_team_map[normalized_name] = normalize_team_abbr(team_abbr)
     hit_rate_bets, hit_rate_bets_by_game, alt_hit_rate_bets, alt_hit_rate_bets_by_game = (
         compute_perfect_hit_rate_bets(
-        seasonal_player_gamelogs,
-        props_odds,
-        games_today_df,
-        window=10
+            seasonal_player_gamelogs,
+            props_odds,
+            games_today_df,
+            window=10,
+            player_team_map=player_team_map
         )
     )
     print_hit_rate_bets(hit_rate_bets, window=10)

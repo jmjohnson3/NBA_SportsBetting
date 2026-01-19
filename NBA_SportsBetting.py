@@ -1184,36 +1184,107 @@ def format_hit_rate_bet(player_name: str, market: str, line: float, direction: s
     return f"{base} (last {window}: {window}/{window})"
 
 
-def send_discord_value_bets(value_bets_by_game):
-    if not DISCORD_BOT_TOKEN or not DISCORD_CHANNEL_ID:
-        logging.info("DISCORD_BOT_TOKEN or DISCORD_CHANNEL_ID not set; skipping Discord value bet post.")
+def normalize_player_name(name: str) -> str:
+    if not name:
+        return ""
+    cleaned = "".join(ch for ch in name.upper().strip() if ch.isalnum() or ch.isspace())
+    return " ".join(cleaned.split())
+
+
+def normalize_team_abbr(team_abbr: str) -> str:
+    if not team_abbr:
+        return team_abbr
+    normalized = team_abbr.upper().strip()
+    return {
+        "BRO": "BKN"
+    }.get(normalized, normalized)
+
+
+def send_discord_message(content: str) -> None:
+    if not content:
         return
-    if not value_bets_by_game:
-        logging.info("No value bets to send to Discord.")
-        return
-    try:
-        headers = {"Authorization": f"Bot {DISCORD_BOT_TOKEN}"}
-        for game_key, bets in value_bets_by_game.items():
-            if not bets:
-                continue
-            lines = [f"{PLAYBOOK_MENTION} **{game_key}**"]
-            lines.extend(f"- {bet}" for bet in bets)
-            content = "\n".join(lines)
+    if DISCORD_BOT_TOKEN and DISCORD_CHANNEL_ID:
+        try:
             response = requests.post(
                 f"https://discord.com/api/v10/channels/{DISCORD_CHANNEL_ID}/messages",
-                headers = headers,
+                headers={"Authorization": f"Bot {DISCORD_BOT_TOKEN}"},
                 json={
                     "content": content,
                     "allowed_mentions": {"users": [PLAYBOOK_USER_ID]}
                 },
                 timeout=10
             )
+            if response.status_code < 400:
+                return
+            logging.error("Discord post failed: %s %s", response.status_code, response.text)
+        except Exception as exc:
+            logging.error("Failed to send Discord bot message: %s", exc)
+    if DISCORD_WEBHOOK_URL:
+        try:
+            response = requests.post(
+                DISCORD_WEBHOOK_URL,
+                json={"content": content},
+                timeout=10
+            )
             if response.status_code >= 400:
-                logging.error("Discord post failed for %s: %s %s", game_key, response.status_code,
-                              response.text)
-            time.sleep(DISCORD_WEBHOOK_DELAY_SECONDS)
-    except Exception as exc:
-        logging.error("Failed to send Discord message: %s", exc)
+                logging.error("Discord webhook post failed: %s %s", response.status_code, response.text)
+        except Exception as exc:
+            logging.error("Failed to send Discord webhook message: %s", exc)
+
+
+def send_discord_value_bets(value_bets_by_game):
+    if not value_bets_by_game:
+        logging.info("No value bets to send to Discord.")
+        return
+    for game_key, bets in value_bets_by_game.items():
+        if not bets:
+            continue
+        lines = [f"{PLAYBOOK_MENTION} **{game_key}**"]
+        lines.extend(f"- {bet}" for bet in bets)
+        content = "\n".join(lines)
+        send_discord_message(content)
+        time.sleep(DISCORD_WEBHOOK_DELAY_SECONDS)
+
+
+def send_discord_hit_rate_bets(hit_rate_bets_by_game, window: int = 5):
+    if not hit_rate_bets_by_game:
+        logging.info("No hit rate bets to send to Discord.")
+        return
+    for game_key, bets in hit_rate_bets_by_game.items():
+        if not bets:
+            continue
+        lines = [
+            f"{PLAYBOOK_MENTION} **{game_key}**",
+            f"100% hit rate over last {window} games:"
+        ]
+        lines.extend(f"- {bet}" for bet in bets)
+        content = "\n".join(lines)
+        send_discord_message(content)
+        time.sleep(DISCORD_WEBHOOK_DELAY_SECONDS)
+
+
+def print_hit_rate_bets(hit_rate_bets, window: int = 5):
+    console = Console()
+    if not hit_rate_bets:
+        console.print(f"[yellow]No 100% hit rate bets found over the last {window} games.[/yellow]")
+        return
+    table = Table(title=f"100% Hit Rate Bets (Last {window} Games)", show_header=True, header_style="bold magenta")
+    table.add_column("Game", style="white", no_wrap=True)
+    table.add_column("Player", style="white", no_wrap=True)
+    table.add_column("Market", style="cyan")
+    table.add_column("Line", justify="right")
+    table.add_column("Direction", style="green")
+    table.add_column(f"Last {window}", justify="center")
+    for bet in hit_rate_bets:
+        table.add_row(
+            bet["game"],
+            bet["player"],
+            bet["market"],
+            f"{bet['line']:.2f}",
+            bet["direction"],
+            f"{window}/{window}"
+        )
+    console.print(table)
 
 
 def send_discord_hit_rate_bets(hit_rate_bets_by_game, window: int = 5):
@@ -1287,9 +1358,9 @@ def get_teams_with_games(games_df, target_date):
         logging.info("Scheduled game on %s: %s vs %s, startTime: %s, playedStatus: %s", target_date, home_abbr,
                      away_abbr, game.get("startTime"), game.get("playedStatus", "N/A"))
         if home_abbr:
-            teams.add(home_abbr)
+            teams.add(normalize_team_abbr(home_abbr))
         if away_abbr:
-            teams.add(away_abbr)
+            teams.add(normalize_team_abbr(away_abbr))
     print("Teams with games on", target_date, ":", teams)
     return list(teams)
 
@@ -1319,6 +1390,18 @@ def compute_perfect_hit_rate_bets(player_gamelogs_df, props_odds, games_today_df
     if not props_odds:
         logging.info("No props odds available for hit rate evaluation.")
         return [], {}
+    normalized_props = {}
+    for key, value in props_odds.items():
+        if not key:
+            continue
+        try:
+            name_part, market = key.rsplit("_", 1)
+        except ValueError:
+            continue
+        normalized_name = normalize_player_name(name_part)
+        if not normalized_name:
+            continue
+        normalized_props[f"{normalized_name}_{market}"] = value
     df = player_gamelogs_df.copy()
     if "stats" in df.columns and df["stats"].apply(lambda x: isinstance(x, dict)).all():
         stats_flat = pd.json_normalize(df["stats"])
@@ -1366,7 +1449,7 @@ def compute_perfect_hit_rate_bets(player_gamelogs_df, props_odds, games_today_df
         return None
 
     df["team_abbr"] = df.apply(extract_team_abbr, axis=1)
-    df["team_abbr"] = df["team_abbr"].apply(lambda x: str(x).upper().strip() if pd.notna(x) else None)
+    df["team_abbr"] = df["team_abbr"].apply(lambda x: normalize_team_abbr(str(x)) if pd.notna(x) else None)
 
     game_lookup = {}
     for _, game in games_today_df.iterrows():
@@ -1379,8 +1462,8 @@ def compute_perfect_hit_rate_bets(player_gamelogs_df, props_odds, games_today_df
             away_abbr = away_team.get("abbreviation") if isinstance(away_team, dict) else away_team
         if home_abbr and away_abbr:
             game_key = f"{away_abbr} vs {home_abbr}"
-            game_lookup[str(home_abbr).upper().strip()] = game_key
-            game_lookup[str(away_abbr).upper().strip()] = game_key
+            game_lookup[normalize_team_abbr(str(home_abbr))] = game_key
+            game_lookup[normalize_team_abbr(str(away_abbr))] = game_key
 
     def parse_prop_line(value):
         try:
@@ -1405,13 +1488,13 @@ def compute_perfect_hit_rate_bets(player_gamelogs_df, props_odds, games_today_df
             player_name = str(player_info).strip()
         if not player_name:
             continue
-        player_name_upper = player_name.upper().strip()
+        player_name_upper = normalize_player_name(player_name)
         team_abbr = last_games["team_abbr"].dropna().iloc[0] if last_games["team_abbr"].notna().any() else None
         if not team_abbr or team_abbr not in game_lookup:
             continue
         game_key = game_lookup[team_abbr]
         for market, stat_col in market_cols.items():
-            prop_line = parse_prop_line(props_odds.get(f"{player_name_upper}_{market}"))
+            prop_line = parse_prop_line(normalized_props.get(f"{player_name_upper}_{market}"))
             if prop_line is None:
                 continue
             stat_values = pd.to_numeric(last_games[stat_col], errors="coerce")
@@ -2890,6 +2973,10 @@ def main():
     print_hit_rate_bets(hit_rate_bets, window=5)
     if hit_rate_bets_by_game:
         send_discord_hit_rate_bets(hit_rate_bets_by_game, window=5)
+    else:
+        send_discord_message(
+            f"{PLAYBOOK_MENTION} No 100% hit rate bets found over the last 5 games."
+        )
     print_game_and_player_predictions(merged_features_today, player_stats_ready_df, player_model, feat_cols,
                                       target_cols, nba_odds, props_odds, thresholds, team_stats_df)
     build_html_predictions(merged_features_today, player_stats_ready_df, player_model, feat_cols, target_cols,

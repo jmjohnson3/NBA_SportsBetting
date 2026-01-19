@@ -24,8 +24,6 @@ import numpy as np
 from contextlib import redirect_stdout
 from rich.console import Console
 from rich.table import Table
-import smtplib
-from email.message import EmailMessage
 from jinja2 import Template
 import aiohttp
 from scipy.stats import norm
@@ -1169,85 +1167,6 @@ def build_html_predictions(merged_features, player_stats_df, player_model, feat_
     template = Template(template_str)
     html_result = template.render(games=games_output)
     return html_result
-
-
-def generate_html_email_body(plain_text):
-    html_template = f"""<!DOCTYPE html>
-    <html>
-      <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>NBA Predictions Output</title>
-        <style type="text/css">
-          body {{
-            margin: 0;
-            padding: 0;
-            background-color: #f7f7f7;
-            font-family: Arial, sans-serif;
-            font-size: 16px;
-            color: #333333;
-          }}
-          .container {{
-            width: 100%;
-            max-width: 600px;
-            margin: auto;
-            background-color: #ffffff;
-            padding: 20px;
-          }}
-          h2 {{
-            text-align: center;
-            color: #2a2a2a;
-          }}
-          pre {{
-            background-color: #f4f4f4;
-            padding: 10px;
-            border-radius: 5px;
-            overflow-x: auto;
-            white-space: pre-wrap;
-            word-wrap: break-word;
-          }}
-          @media only screen and (max-width: 600px) {{
-            .container {{
-              width: 100%;
-              padding: 10px;
-            }}
-            h2 {{
-              font-size: 20px;
-            }}
-            body {{
-              font-size: 14px;
-            }}
-          }}
-        </style>
-      </head>
-      <body>
-        <div class="container">
-          <h2>NBA Predictions Output</h2>
-          <pre>{plain_text}</pre>
-        </div>
-      </body>
-    </html>
-    """
-    return html_template
-
-
-def send_email(subject, plain_body, to_email, html_body=None):
-    msg = EmailMessage()
-    msg['Subject'] = subject
-    msg['From'] = "jjohnson0636@gmail.com"
-    msg['To'] = to_email
-    msg.set_content(plain_body if plain_body else "Your email client does not support HTML.")
-    if html_body:
-        msg.add_alternative(html_body, subtype='html')
-    try:
-        with smtplib.SMTP_SSL('smtp.gmail.com', 465) as smtp:
-            smtp.login("jjohnson0636@gmail.com", "wodh yzme squo lmzc")
-            smtp.send_message(msg)
-        logging.info("Email sent successfully to %s", to_email)
-    except smtplib.SMTPAuthenticationError as e:
-        logging.error("SMTP Authentication Error: %s. Please use an application-specific password.", e)
-    except Exception as e:
-        logging.error("Failed to send email: %s", e)
 
 
 def format_playbook_bet(player_name: str, market: str, line: float, direction: str) -> str:
@@ -2755,10 +2674,8 @@ def main():
     thresholds = {"player_points": 3.5, "player_assists": 2.5, "player_rebounds": 2.5, "player_threes": 2.5}
     print_game_and_player_predictions(merged_features_today, player_stats_ready_df, player_model, feat_cols,
                                       target_cols, nba_odds, props_odds, thresholds, team_stats_df)
-    predictions_html = build_html_predictions(merged_features_today, player_stats_ready_df, player_model, feat_cols,
-                                              target_cols, nba_odds, props_odds, thresholds, team_stats_df)
-    send_email(subject="NBA Predictions Output", plain_body="Here is the plain text fallback if HTML is not supported.",
-               to_email="jjohnson0636@gmail.com", html_body=predictions_html)
+    build_html_predictions(merged_features_today, player_stats_ready_df, player_model, feat_cols, target_cols,
+                           nba_odds, props_odds, thresholds, team_stats_df)
     print("Main routine processing complete.")
 
 

@@ -1287,6 +1287,65 @@ def print_hit_rate_bets(hit_rate_bets, window: int = 5):
     console.print(table)
 
 
+def send_discord_hit_rate_bets(hit_rate_bets_by_game, window: int = 5):
+    if not DISCORD_BOT_TOKEN or not DISCORD_CHANNEL_ID:
+        logging.info("DISCORD_BOT_TOKEN or DISCORD_CHANNEL_ID not set; skipping Discord hit rate post.")
+        return
+    if not hit_rate_bets_by_game:
+        logging.info("No hit rate bets to send to Discord.")
+        return
+    try:
+        headers = {"Authorization": f"Bot {DISCORD_BOT_TOKEN}"}
+        for game_key, bets in hit_rate_bets_by_game.items():
+            if not bets:
+                continue
+            lines = [
+                f"{PLAYBOOK_MENTION} **{game_key}**",
+                f"100% hit rate over last {window} games:"
+            ]
+            lines.extend(f"- {bet}" for bet in bets)
+            content = "\n".join(lines)
+            response = requests.post(
+                f"https://discord.com/api/v10/channels/{DISCORD_CHANNEL_ID}/messages",
+                headers=headers,
+                json={
+                    "content": content,
+                    "allowed_mentions": {"users": [PLAYBOOK_USER_ID]}
+                },
+                timeout=10
+            )
+            if response.status_code >= 400:
+                logging.error("Discord hit rate post failed for %s: %s %s", game_key, response.status_code,
+                              response.text)
+            time.sleep(DISCORD_WEBHOOK_DELAY_SECONDS)
+    except Exception as exc:
+        logging.error("Failed to send Discord hit rate message: %s", exc)
+
+
+def print_hit_rate_bets(hit_rate_bets, window: int = 5):
+    console = Console()
+    if not hit_rate_bets:
+        console.print(f"[yellow]No 100% hit rate bets found over the last {window} games.[/yellow]")
+        return
+    table = Table(title=f"100% Hit Rate Bets (Last {window} Games)", show_header=True, header_style="bold magenta")
+    table.add_column("Game", style="white", no_wrap=True)
+    table.add_column("Player", style="white", no_wrap=True)
+    table.add_column("Market", style="cyan")
+    table.add_column("Line", justify="right")
+    table.add_column("Direction", style="green")
+    table.add_column(f"Last {window}", justify="center")
+    for bet in hit_rate_bets:
+        table.add_row(
+            bet["game"],
+            bet["player"],
+            bet["market"],
+            f"{bet['line']:.2f}",
+            bet["direction"],
+            f"{window}/{window}"
+        )
+    console.print(table)
+
+
 def get_teams_with_games(games_df, target_date):
     target_date = pd.to_datetime(target_date).date()
     scheduled_games = games_df[games_df["local_date"] == target_date]

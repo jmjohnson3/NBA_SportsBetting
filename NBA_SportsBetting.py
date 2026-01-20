@@ -1344,7 +1344,8 @@ def print_alt_hit_rate_bets(hit_rate_bets, window: int = 10):
 
 def compute_alt_lines_from_recent_games(player_gamelogs_df, games_today_df=None, window: int = 10,
                                         cutoff_date: date | None = None, teams_filter=None,
-                                        player_team_map=None, include_under: bool = False):
+                                        player_team_map=None, include_under: bool = False,
+                                        min_alt_line: float = 0.5):
     if player_gamelogs_df.empty:
         logging.info("No player gamelogs available for alternative line evaluation.")
         return [], {}
@@ -1492,30 +1493,32 @@ def compute_alt_lines_from_recent_games(player_gamelogs_df, games_today_df=None,
                 continue
             min_value = stat_values.min()
             max_value = stat_values.max()
-            alt_over_line = math.floor(min_value)
-            alt_under_line = math.ceil(max_value)
+            alt_over_line = min_value - 0.5
+            alt_under_line = max_value + 0.5
             market_label = market.replace("player_", "").replace("_", " ").title()
-            alt_hit_rate_bets.append({
-                "game": game_key,
-                "player": player_name,
-                "market": market_label,
-                "line": alt_over_line,
-                "direction": "over"
-            })
-            alt_hit_rate_bets_by_game.setdefault(game_key, []).append(
-                format_alt_hit_rate_bet(player_name, market, alt_over_line, "over", window)
-            )
-            if include_under:
+            if alt_over_line >= min_alt_line:
                 alt_hit_rate_bets.append({
                     "game": game_key,
                     "player": player_name,
                     "market": market_label,
-                    "line": alt_under_line,
-                    "direction": "under"
+                    "line": alt_over_line,
+                    "direction": "over"
                 })
                 alt_hit_rate_bets_by_game.setdefault(game_key, []).append(
-                    format_alt_hit_rate_bet(player_name, market, alt_under_line, "under", window)
+                    format_alt_hit_rate_bet(player_name, market, alt_over_line, "over", window)
                 )
+            if include_under:
+                if alt_under_line >= min_alt_line:
+                    alt_hit_rate_bets.append({
+                        "game": game_key,
+                        "player": player_name,
+                        "market": market_label,
+                        "line": alt_under_line,
+                        "direction": "under"
+                    })
+                    alt_hit_rate_bets_by_game.setdefault(game_key, []).append(
+                        format_alt_hit_rate_bet(player_name, market, alt_under_line, "under", window)
+                    )
     print(f"Alt-line scan produced {qualified_players} players with {window} games.")
     print(f"Alt-line scan produced {len(alt_hit_rate_bets)} bets.")
     return alt_hit_rate_bets, alt_hit_rate_bets_by_game

@@ -8,6 +8,7 @@ import hashlib
 import os
 import psycopg2
 import psycopg2.extras
+from psycopg2 import sql
 import io
 import time
 from datetime import datetime, timedelta, date, timezone
@@ -1350,6 +1351,8 @@ def compute_alt_lines_from_recent_games(player_gamelogs_df, games_today_df=None,
     if player_team_map is None:
         player_team_map = {}
     df = player_gamelogs_df.copy()
+    if "player_name" in df.columns and "player" in df.columns:
+        df = df.drop(columns=["player"])
     if "stats" in df.columns and df["stats"].apply(lambda x: isinstance(x, dict)).all():
         stats_flat = pd.json_normalize(df["stats"])
         stats_flat.columns = [f"stats_{col}" for col in stats_flat.columns]
@@ -1379,7 +1382,9 @@ def compute_alt_lines_from_recent_games(player_gamelogs_df, games_today_df=None,
             df["player_id"] = df["player"].apply(lambda x: x.get("id") if isinstance(x, dict) else None)
         elif "player.id" in df.columns:
             df["player_id"] = df["player.id"]
-    if "game.startTime" in df.columns:
+    if "game_date" in df.columns:
+        df["game_date"] = pd.to_datetime(df["game_date"], errors="coerce")
+    elif "game.startTime" in df.columns:
         df["game_date"] = pd.to_datetime(df["game.startTime"], errors="coerce")
     elif "game_startTime" in df.columns:
         df["game_date"] = pd.to_datetime(df["game_startTime"], errors="coerce")
@@ -1399,8 +1404,11 @@ def compute_alt_lines_from_recent_games(player_gamelogs_df, games_today_df=None,
             return team.get("abbreviation")
         return None
 
-    df["team_abbr"] = df.apply(extract_team_abbr, axis=1)
-    df["team_abbr"] = df["team_abbr"].apply(lambda x: normalize_team_abbr(str(x)) if pd.notna(x) else None)
+    if "team_abbr" in df.columns:
+        df["team_abbr"] = df["team_abbr"].apply(lambda x: normalize_team_abbr(str(x)) if pd.notna(x) else None)
+    else:
+        df["team_abbr"] = df.apply(extract_team_abbr, axis=1)
+        df["team_abbr"] = df["team_abbr"].apply(lambda x: normalize_team_abbr(str(x)) if pd.notna(x) else None)
     if teams_filter:
         normalized_teams = {normalize_team_abbr(team) for team in teams_filter}
         df = df[df["team_abbr"].isin(normalized_teams)]
@@ -1430,11 +1438,14 @@ def compute_alt_lines_from_recent_games(player_gamelogs_df, games_today_df=None,
         last_games = group.head(window)
         if len(last_games) < window:
             continue
-        player_info = last_games.iloc[0].get("player")
-        if isinstance(player_info, dict):
-            player_name = f"{player_info.get('firstName', '')} {player_info.get('lastName', '')}".strip()
+        if "player_name" in last_games.columns:
+            player_name = str(last_games.iloc[0].get("player_name", "")).strip()
         else:
-            player_name = str(player_info).strip()
+            player_info = last_games.iloc[0].get("player")
+            if isinstance(player_info, dict):
+                player_name = f"{player_info.get('firstName', '')} {player_info.get('lastName', '')}".strip()
+            else:
+                player_name = str(player_info).strip()
         if not player_name:
             continue
         player_name_upper = normalize_player_name(player_name)
@@ -1518,6 +1529,82 @@ def fetch_seasonal_player_gamelogs_for_teams(season, teams):
     return df_logs
 
 
+def fetch_player_gamelogs_from_db(cutoff_date: date | None = None) -> pd.DataFrame:
+    try:
+        conn = get_db_connection()
+    except Exception as exc:
+        logging.error("Database connection unavailable for gamelog fetch: %s", exc)
+        return pd.DataFrame()
+    column_query = """
+        SELECT table_name, column_name
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+    """
+    with conn:
+        with conn.cursor() as cursor:
+            cursor.execute(column_query)
+            rows = cursor.fetchall()
+    if not rows:
+        return pd.DataFrame()
+    table_columns = {}
+    for table_name, column_name in rows:
+        table_columns.setdefault(table_name, set()).add(column_name.lower())
+
+    required = {
+        "player_id": ["player_id", "playerid", "player_id_id", "playerid_id"],
+        "player_name": ["player_name", "player", "name", "full_name", "player_full_name"],
+        "team_abbr": ["team_abbr", "team", "team_abbreviation", "teamabbr", "team_abbrv"],
+        "game_date": ["game_date", "game_datetime", "game_start", "start_time", "starttime", "local_date", "date"],
+        "pts": ["pts", "points", "points_scored", "stat_points", "stats_pts"],
+        "ast": ["ast", "assists", "stat_assists", "stats_ast"],
+        "reb": ["reb", "rebounds", "total_rebounds", "stat_rebounds", "stats_reb"]
+    }
+
+    def pick_column(columns, candidates):
+        for candidate in candidates:
+            if candidate in columns:
+                return candidate
+        return None
+
+    best_table = None
+    best_score = 0
+    best_columns = {}
+    for table_name, columns in table_columns.items():
+        resolved = {key: pick_column(columns, candidates) for key, candidates in required.items()}
+        score = sum(1 for col in resolved.values() if col)
+        if resolved["pts"] and resolved["ast"] and resolved["reb"] and resolved["game_date"] and resolved["player_id"]:
+            if score > best_score:
+                best_score = score
+                best_table = table_name
+                best_columns = resolved
+    if not best_table:
+        logging.warning("No suitable gamelog table found in database.")
+        return pd.DataFrame()
+
+    select_columns = [
+        sql.SQL("{} AS player_id").format(sql.Identifier(best_columns["player_id"])),
+        sql.SQL("{} AS player_name").format(sql.Identifier(best_columns["player_name"]))
+        if best_columns["player_name"] else sql.SQL("NULL AS player_name"),
+        sql.SQL("{} AS team_abbr").format(sql.Identifier(best_columns["team_abbr"]))
+        if best_columns["team_abbr"] else sql.SQL("NULL AS team_abbr"),
+        sql.SQL("{} AS game_date").format(sql.Identifier(best_columns["game_date"])),
+        sql.SQL("{} AS pts").format(sql.Identifier(best_columns["pts"])),
+        sql.SQL("{} AS ast").format(sql.Identifier(best_columns["ast"])),
+        sql.SQL("{} AS reb").format(sql.Identifier(best_columns["reb"]))
+    ]
+    query = sql.SQL("SELECT {fields} FROM {table}").format(
+        fields=sql.SQL(", ").join(select_columns),
+        table=sql.Identifier(best_table)
+    )
+    params = []
+    if cutoff_date is not None:
+        query += sql.SQL(" WHERE {col}::date <= %s").format(sql.Identifier(best_columns["game_date"]))
+        params.append(cutoff_date)
+    with conn:
+        db_df = pd.read_sql_query(query, conn, params=params)
+    return db_df
+
+
 def compute_perfect_hit_rate_bets(player_gamelogs_df, props_odds, games_today_df, window: int = 5,
                                   player_team_map=None):
     if player_gamelogs_df.empty:
@@ -1570,7 +1657,9 @@ def compute_perfect_hit_rate_bets(player_gamelogs_df, props_odds, games_today_df
             df["player_id"] = df["player"].apply(lambda x: x.get("id") if isinstance(x, dict) else None)
         elif "player.id" in df.columns:
             df["player_id"] = df["player.id"]
-    if "game.startTime" in df.columns:
+    if "game_date" in df.columns:
+        df["game_date"] = pd.to_datetime(df["game_date"], errors="coerce")
+    elif "game.startTime" in df.columns:
         df["game_date"] = pd.to_datetime(df["game.startTime"], errors="coerce")
     elif "game_startTime" in df.columns:
         df["game_date"] = pd.to_datetime(df["game_startTime"], errors="coerce")
@@ -1586,8 +1675,11 @@ def compute_perfect_hit_rate_bets(player_gamelogs_df, props_odds, games_today_df
             return team.get("abbreviation")
         return None
 
-    df["team_abbr"] = df.apply(extract_team_abbr, axis=1)
-    df["team_abbr"] = df["team_abbr"].apply(lambda x: normalize_team_abbr(str(x)) if pd.notna(x) else None)
+    if "team_abbr" in df.columns:
+        df["team_abbr"] = df["team_abbr"].apply(lambda x: normalize_team_abbr(str(x)) if pd.notna(x) else None)
+    else:
+        df["team_abbr"] = df.apply(extract_team_abbr, axis=1)
+        df["team_abbr"] = df["team_abbr"].apply(lambda x: normalize_team_abbr(str(x)) if pd.notna(x) else None)
 
     game_lookup = {}
     for _, game in games_today_df.iterrows():
@@ -1621,11 +1713,14 @@ def compute_perfect_hit_rate_bets(player_gamelogs_df, props_odds, games_today_df
         last_games = group.head(window)
         if len(last_games) < window:
             continue
-        player_info = last_games.iloc[0].get("player")
-        if isinstance(player_info, dict):
-            player_name = f"{player_info.get('firstName', '')} {player_info.get('lastName', '')}".strip()
+        if "player_name" in last_games.columns:
+            player_name = str(last_games.iloc[0].get("player_name", "")).strip()
         else:
-            player_name = str(player_info).strip()
+            player_info = last_games.iloc[0].get("player")
+            if isinstance(player_info, dict):
+                player_name = f"{player_info.get('firstName', '')} {player_info.get('lastName', '')}".strip()
+            else:
+                player_name = str(player_info).strip()
         if not player_name:
             continue
         player_name_upper = normalize_player_name(player_name)
@@ -3145,8 +3240,10 @@ def main():
         if normalized_name and team_abbr:
             player_team_map[normalized_name] = normalize_team_abbr(team_abbr)
     alt_cutoff = TARGET_DATE - timedelta(days=1)
+    db_player_gamelogs = fetch_player_gamelogs_from_db(alt_cutoff)
+    gamelog_source = db_player_gamelogs if not db_player_gamelogs.empty else seasonal_player_gamelogs
     alt_hit_rate_bets, alt_hit_rate_bets_by_game = compute_alt_lines_from_recent_games(
-        seasonal_player_gamelogs,
+        gamelog_source,
         games_today_df,
         window=10,
         cutoff_date=alt_cutoff,

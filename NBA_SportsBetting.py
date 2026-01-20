@@ -1382,12 +1382,23 @@ def compute_alt_lines_from_recent_games(player_gamelogs_df, games_today_df=None,
             df["player_id"] = df["player"].apply(lambda x: x.get("id") if isinstance(x, dict) else None)
         elif "player.id" in df.columns:
             df["player_id"] = df["player.id"]
+    if "player_name" not in df.columns and "player" in df.columns:
+        def build_player_name(value):
+            if isinstance(value, dict):
+                return f"{value.get('firstName', '')} {value.get('lastName', '')}".strip()
+            return str(value).strip()
+        df["player_name"] = df["player"].apply(build_player_name)
     if "game_date" in df.columns:
         df["game_date"] = pd.to_datetime(df["game_date"], errors="coerce")
     elif "game.startTime" in df.columns:
         df["game_date"] = pd.to_datetime(df["game.startTime"], errors="coerce")
     elif "game_startTime" in df.columns:
         df["game_date"] = pd.to_datetime(df["game_startTime"], errors="coerce")
+    elif "game" in df.columns:
+        df["game_date"] = pd.to_datetime(
+            df["game"].apply(lambda x: x.get("startTime") if isinstance(x, dict) else None),
+            errors="coerce"
+        )
     else:
         df["game_date"] = pd.NaT
 

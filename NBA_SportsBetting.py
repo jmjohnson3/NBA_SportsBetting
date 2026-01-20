@@ -1341,7 +1341,7 @@ def print_alt_hit_rate_bets(hit_rate_bets, window: int = 10):
     console.print(table)
 
 
-def compute_alt_lines_from_recent_games(player_gamelogs_df, games_today_df, window: int = 10,
+def compute_alt_lines_from_recent_games(player_gamelogs_df, games_today_df=None, window: int = 10,
                                         cutoff_date: date | None = None, teams_filter=None,
                                         player_team_map=None, include_under: bool = False):
     if player_gamelogs_df.empty:
@@ -1406,18 +1406,19 @@ def compute_alt_lines_from_recent_games(player_gamelogs_df, games_today_df, wind
         df = df[df["team_abbr"].isin(normalized_teams)]
 
     game_lookup = {}
-    for _, game in games_today_df.iterrows():
-        home_abbr = game.get("home_team_abbr")
-        away_abbr = game.get("away_team_abbr")
-        if not home_abbr or not away_abbr:
-            home_team = game.get("homeTeam")
-            away_team = game.get("awayTeam")
-            home_abbr = home_team.get("abbreviation") if isinstance(home_team, dict) else home_team
-            away_abbr = away_team.get("abbreviation") if isinstance(away_team, dict) else away_team
-        if home_abbr and away_abbr:
-            game_key = f"{away_abbr} vs {home_abbr}"
-            game_lookup[normalize_team_abbr(str(home_abbr))] = game_key
-            game_lookup[normalize_team_abbr(str(away_abbr))] = game_key
+    if games_today_df is not None and not games_today_df.empty:
+        for _, game in games_today_df.iterrows():
+            home_abbr = game.get("home_team_abbr")
+            away_abbr = game.get("away_team_abbr")
+            if not home_abbr or not away_abbr:
+                home_team = game.get("homeTeam")
+                away_team = game.get("awayTeam")
+                home_abbr = home_team.get("abbreviation") if isinstance(home_team, dict) else home_team
+                away_abbr = away_team.get("abbreviation") if isinstance(away_team, dict) else away_team
+            if home_abbr and away_abbr:
+                game_key = f"{away_abbr} vs {home_abbr}"
+                game_lookup[normalize_team_abbr(str(home_abbr))] = game_key
+                game_lookup[normalize_team_abbr(str(away_abbr))] = game_key
 
     alt_hit_rate_bets = []
     alt_hit_rate_bets_by_game = {}
@@ -1446,7 +1447,7 @@ def compute_alt_lines_from_recent_games(player_gamelogs_df, games_today_df, wind
             continue
         game_key = game_lookup.get(team_abbr) if team_abbr else None
         if not game_key:
-            game_key = f"{team_abbr or 'Unknown'}"
+            game_key = f"{team_abbr or 'All Games'}"
         for market, stat_col in market_cols.items():
             stat_values = pd.to_numeric(last_games[stat_col], errors="coerce")
             if stat_values.isna().any():
@@ -3149,7 +3150,7 @@ def main():
         games_today_df,
         window=10,
         cutoff_date=alt_cutoff,
-        teams_filter=teams_with_games,
+        teams_filter=None,
         player_team_map=player_team_map,
         include_under=False
     )

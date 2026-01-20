@@ -1342,10 +1342,13 @@ def print_alt_hit_rate_bets(hit_rate_bets, window: int = 10):
 
 
 def compute_alt_lines_from_recent_games(player_gamelogs_df, games_today_df, window: int = 10,
-                                        cutoff_date: date | None = None, teams_filter=None):
+                                        cutoff_date: date | None = None, teams_filter=None,
+                                        player_team_map=None, include_under: bool = False):
     if player_gamelogs_df.empty:
         logging.info("No player gamelogs available for alternative line evaluation.")
         return [], {}
+    if player_team_map is None:
+        player_team_map = {}
     df = player_gamelogs_df.copy()
     if "stats" in df.columns and df["stats"].apply(lambda x: isinstance(x, dict)).all():
         stats_flat = pd.json_normalize(df["stats"])
@@ -1433,19 +1436,25 @@ def compute_alt_lines_from_recent_games(player_gamelogs_df, games_today_df, wind
             player_name = str(player_info).strip()
         if not player_name:
             continue
+        player_name_upper = normalize_player_name(player_name)
         team_abbr = last_games["team_abbr"].dropna().iloc[0] if last_games["team_abbr"].notna().any() else None
         team_abbr = normalize_team_abbr(team_abbr) if team_abbr else None
-        if not team_abbr or team_abbr not in game_lookup:
+        if not team_abbr:
+            team_abbr = player_team_map.get(player_name_upper)
+            team_abbr = normalize_team_abbr(team_abbr) if team_abbr else None
+        if teams_filter and team_abbr not in {normalize_team_abbr(team) for team in teams_filter}:
             continue
-        game_key = game_lookup[team_abbr]
+        game_key = game_lookup.get(team_abbr) if team_abbr else None
+        if not game_key:
+            game_key = f"{team_abbr or 'Unknown'}"
         for market, stat_col in market_cols.items():
             stat_values = pd.to_numeric(last_games[stat_col], errors="coerce")
             if stat_values.isna().any():
                 continue
             min_value = stat_values.min()
             max_value = stat_values.max()
-            alt_over_line = min_value - 0.5
-            alt_under_line = max_value + 0.5
+            alt_over_line = math.floor(min_value)
+            alt_under_line = math.ceil(max_value)
             market_label = market.replace("player_", "").replace("_", " ").title()
             alt_hit_rate_bets.append({
                 "game": game_key,
@@ -1454,19 +1463,20 @@ def compute_alt_lines_from_recent_games(player_gamelogs_df, games_today_df, wind
                 "line": alt_over_line,
                 "direction": "over"
             })
-            alt_hit_rate_bets.append({
-                "game": game_key,
-                "player": player_name,
-                "market": market_label,
-                "line": alt_under_line,
-                "direction": "under"
-            })
             alt_hit_rate_bets_by_game.setdefault(game_key, []).append(
                 format_alt_hit_rate_bet(player_name, market, alt_over_line, "over", window)
             )
-            alt_hit_rate_bets_by_game.setdefault(game_key, []).append(
-                format_alt_hit_rate_bet(player_name, market, alt_under_line, "under", window)
-            )
+            if include_under:
+                alt_hit_rate_bets.append({
+                    "game": game_key,
+                    "player": player_name,
+                    "market": market_label,
+                    "line": alt_under_line,
+                    "direction": "under"
+                })
+                alt_hit_rate_bets_by_game.setdefault(game_key, []).append(
+                    format_alt_hit_rate_bet(player_name, market, alt_under_line, "under", window)
+                )
     return alt_hit_rate_bets, alt_hit_rate_bets_by_game
 
 
@@ -3122,13 +3132,26 @@ def main():
     global props_odds
     props_odds = get_all_player_props_odds(nba_odds)
     thresholds = {"player_points": 3.5, "player_assists": 2.5, "player_rebounds": 2.5, "player_threes": 2.5}
+    player_team_map = {}
+    for _, row in player_stats_ready_df.iterrows():
+        player_info = row.get("player")
+        if isinstance(player_info, dict):
+            player_name = f"{player_info.get('firstName', '')} {player_info.get('lastName', '')}".strip()
+        else:
+            player_name = str(player_info).strip()
+        normalized_name = normalize_player_name(player_name)
+        team_abbr = row.get("team_abbr")
+        if normalized_name and team_abbr:
+            player_team_map[normalized_name] = normalize_team_abbr(team_abbr)
     alt_cutoff = TARGET_DATE - timedelta(days=1)
     alt_hit_rate_bets, alt_hit_rate_bets_by_game = compute_alt_lines_from_recent_games(
         seasonal_player_gamelogs,
         games_today_df,
         window=10,
         cutoff_date=alt_cutoff,
-        teams_filter=teams_with_games
+        teams_filter=teams_with_games,
+        player_team_map=player_team_map,
+        include_under=False
     )
     print_alt_hit_rate_bets(alt_hit_rate_bets, window=10)
     if alt_hit_rate_bets_by_game:

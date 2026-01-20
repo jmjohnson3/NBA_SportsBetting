@@ -1394,6 +1394,7 @@ def compute_alt_lines_from_recent_games(player_gamelogs_df, games_today_df=None,
     if cutoff_date is not None:
         cutoff_timestamp = pd.Timestamp(cutoff_date).normalize()
         df = df[df["game_date"].dt.normalize() <= cutoff_timestamp]
+    logging.info("Alt-line scan base rows after cutoff: %s", len(df))
 
     def extract_team_abbr(row):
         for key in ["teamAbbreviation", "team.abbreviation", "team_abbreviation", "team.abbr", "teamAbbr", "team_abbr"]:
@@ -1412,6 +1413,7 @@ def compute_alt_lines_from_recent_games(player_gamelogs_df, games_today_df=None,
     if teams_filter:
         normalized_teams = {normalize_team_abbr(team) for team in teams_filter}
         df = df[df["team_abbr"].isin(normalized_teams)]
+    logging.info("Alt-line scan rows after team filter: %s", len(df))
 
     game_lookup = {}
     if games_today_df is not None and not games_today_df.empty:
@@ -1430,6 +1432,7 @@ def compute_alt_lines_from_recent_games(player_gamelogs_df, games_today_df=None,
 
     alt_hit_rate_bets = []
     alt_hit_rate_bets_by_game = {}
+    qualified_players = 0
     for _, group in df.groupby("player_id"):
         group = group.dropna(subset=["game_date"])
         if group.empty:
@@ -1438,6 +1441,7 @@ def compute_alt_lines_from_recent_games(player_gamelogs_df, games_today_df=None,
         last_games = group.head(window)
         if len(last_games) < window:
             continue
+        qualified_players += 1
         if "player_name" in last_games.columns:
             player_name = str(last_games.iloc[0].get("player_name", "")).strip()
         else:
@@ -1489,6 +1493,8 @@ def compute_alt_lines_from_recent_games(player_gamelogs_df, games_today_df=None,
                 alt_hit_rate_bets_by_game.setdefault(game_key, []).append(
                     format_alt_hit_rate_bet(player_name, market, alt_under_line, "under", window)
                 )
+    logging.info("Alt-line scan produced %s players with %s games.", qualified_players, window)
+    logging.info("Alt-line scan produced %s bets.", len(alt_hit_rate_bets))
     return alt_hit_rate_bets, alt_hit_rate_bets_by_game
 
 
@@ -1580,6 +1586,7 @@ def fetch_player_gamelogs_from_db(cutoff_date: date | None = None) -> pd.DataFra
     if not best_table:
         logging.warning("No suitable gamelog table found in database.")
         return pd.DataFrame()
+    logging.info("Using gamelog table '%s' with columns: %s", best_table, best_columns)
 
     select_columns = [
         sql.SQL("{} AS player_id").format(sql.Identifier(best_columns["player_id"])),
@@ -1602,6 +1609,7 @@ def fetch_player_gamelogs_from_db(cutoff_date: date | None = None) -> pd.DataFra
         params.append(cutoff_date)
     with conn:
         db_df = pd.read_sql_query(query, conn, params=params)
+    logging.info("Loaded %s rows from DB gamelog table %s.", len(db_df), best_table)
     return db_df
 
 

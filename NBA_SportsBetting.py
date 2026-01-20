@@ -1389,18 +1389,21 @@ def compute_alt_lines_from_recent_games(player_gamelogs_df, games_today_df=None,
             return str(value).strip()
         df["player_name"] = df["player"].apply(build_player_name)
     if "game_date" in df.columns:
-        df["game_date"] = pd.to_datetime(df["game_date"], errors="coerce")
+        df["game_date"] = pd.to_datetime(df["game_date"], errors="coerce", utc=True)
     elif "game.startTime" in df.columns:
-        df["game_date"] = pd.to_datetime(df["game.startTime"], errors="coerce")
+        df["game_date"] = pd.to_datetime(df["game.startTime"], errors="coerce", utc=True)
     elif "game_startTime" in df.columns:
-        df["game_date"] = pd.to_datetime(df["game_startTime"], errors="coerce")
+        df["game_date"] = pd.to_datetime(df["game_startTime"], errors="coerce", utc=True)
     elif "game" in df.columns:
         df["game_date"] = pd.to_datetime(
             df["game"].apply(lambda x: x.get("startTime") if isinstance(x, dict) else None),
-            errors="coerce"
+            errors="coerce",
+            utc=True
         )
     else:
         df["game_date"] = pd.NaT
+    if "game_date" in df.columns and df["game_date"].dt.tz is not None:
+        df["game_date"] = df["game_date"].dt.tz_localize(None)
 
     if cutoff_date is not None:
         cutoff_timestamp = pd.Timestamp(cutoff_date).normalize()

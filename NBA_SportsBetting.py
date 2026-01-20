@@ -1384,8 +1384,8 @@ def compute_alt_lines_from_recent_games(player_gamelogs_df, games_today_df, wind
         df["game_date"] = pd.NaT
 
     if cutoff_date is not None:
-        cutoff_timestamp = pd.Timestamp(cutoff_date)
-        df = df[df["game_date"].dt.date <= cutoff_timestamp.date()]
+        cutoff_timestamp = pd.Timestamp(cutoff_date).normalize()
+        df = df[df["game_date"].dt.normalize() <= cutoff_timestamp]
 
     def extract_team_abbr(row):
         for key in ["teamAbbreviation", "team.abbreviation", "team_abbreviation", "team.abbr", "teamAbbr", "team_abbr"]:

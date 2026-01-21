@@ -3359,7 +3359,7 @@ def main():
     print("Final today's features shape:", merged_features_today.shape)
     print("Historical features shape:", merged_features_hist.shape)
     print("Today's features shape:", merged_features_today.shape)
-    game_model, game_features = train_game_prediction_model_with_optuna_cv(merged_features_hist, n_trials=1000)
+    game_model, game_features = train_game_prediction_model_with_optuna_cv(merged_features_hist, n_trials=10)
     if game_model is not None:
         nba_odds = get_nba_odds()  # fetch actual game odds
         X_today = merged_features_today[game_features].fillna(0)
@@ -3428,7 +3428,7 @@ def main():
         process_injuries(injuries_data),
         team_stats_df,
         games_today_df,
-        n_trials=1000
+        n_trials=10
     )
 
     X = player_stats_ready_df[feat_cols].values

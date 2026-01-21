@@ -17,8 +17,7 @@ import requests
 import pandas as pd
 from dateutil import parser
 from requests.auth import HTTPBasicAuth
-from sklearn.decomposition import PCA
-from sklearn.model_selection import train_test_split, TimeSeriesSplit
+from sklearn.model_selection import TimeSeriesSplit
 from sklearn.metrics import mean_squared_error, r2_score
 from xgboost import XGBRegressor
 import numpy as np
@@ -31,8 +30,7 @@ from scipy.stats import norm
 from sklearn.cluster import KMeans
 
 # For scaling pipeline and ensemble (if desired)
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler, RobustScaler
+from sklearn.preprocessing import RobustScaler
 
 # Set pandas option to opt in to future downcasting behavior
 pd.set_option('future.no_silent_downcasting', True)
@@ -305,23 +303,45 @@ def schedule_retraining():
     print("Retraining check complete. (Implement scheduling externally.)")
 
 
-def backtest_betting_strategy(historical_df, model, game_features, betting_thresholds):
+def backtest_betting_strategy(historical_df, model, game_features, betting_thresholds, nba_odds,
+                              default_odds=2.0, date_col="local_date"):
     """
-    Backtest the betting strategy on historical data.
+    Backtest the betting strategy on historical data with an out-of-sample split.
     """
+    if historical_df.empty:
+        print("\n=== Backtesting Betting Strategy ===")
+        print("No historical data available for backtesting.")
+        return
+    df = historical_df.copy()
+    if date_col in df.columns:
+        df = df.sort_values(date_col)
+    split_idx = int(len(df) * 0.8)
+    train_df = df.iloc[:split_idx].copy()
+    eval_df = df.iloc[split_idx:].copy()
+    if train_df.empty or eval_df.empty:
+        print("\n=== Backtesting Betting Strategy ===")
+        print("Insufficient data for out-of-sample backtesting.")
+        return
+    X_train = train_df[game_features].fillna(0)
+    train_preds = model.predict(X_train)
+    train_actuals = (train_df["actual_point_diff"] > 0).astype(int).values
+    train_probs = compute_win_probability(train_preds)
+    _, calibrator = calibrate_win_probabilities(train_probs, train_actuals)
+    eval_odds = assign_game_odds(eval_df, nba_odds, default_odds=default_odds)
     total_return = 0
     bets = 0
-    for idx, row in historical_df.iterrows():
+    for idx, row in eval_df.iterrows():
         X = pd.DataFrame([row[game_features].fillna(0)])
         pred_diff = model.predict(X)[0]
-        win_prob = 1.0 / (1.0 + np.exp(-pred_diff / 10.0))
-        sportsbook_odds = 2.0  # example odds
+        raw_prob = compute_win_probability(pred_diff)
+        win_prob = calibrator.predict([raw_prob])[0]
+        sportsbook_odds = eval_odds[eval_df.index.get_loc(idx)]
         kelly = compute_betting_edge(win_prob, sportsbook_odds)
         bet_result = sportsbook_odds - 1 if row.get("actual_point_diff", 0) > 0 else -1
         total_return += kelly * bet_result
         bets += 1
     print("\n=== Backtesting Betting Strategy ===")
-    print(f"Total simulated return over {bets} bets: {total_return:.2f}")
+    print(f"Total simulated return over {bets} out-of-sample bets: {total_return:.2f}")
 
 
 # -------------------------------
@@ -851,6 +871,67 @@ def add_travel_distance_feature(games_df, team_locations, historical_games):
     games_df["home_travel_distance"] = 0.0
     games_df["away_travel_distance"] = 0.0
     return games_df
+
+
+def compute_team_rolling_scores(historical_games, window=10):
+    if historical_games is None or historical_games.empty:
+        return pd.DataFrame()
+    required_cols = {"local_date", "homeTeam", "awayTeam"}
+    if not required_cols.issubset(set(historical_games.columns)):
+        return pd.DataFrame()
+    score_cols = None
+    if {"homeTeamPts", "awayTeamPts"}.issubset(set(historical_games.columns)):
+        score_cols = ("homeTeamPts", "awayTeamPts")
+    elif {"scoring_homeScoreTotal", "scoring_awayScoreTotal"}.issubset(set(historical_games.columns)):
+        score_cols = ("scoring_homeScoreTotal", "scoring_awayScoreTotal")
+    if score_cols is None:
+        return pd.DataFrame()
+
+    def extract_abbr(team):
+        if isinstance(team, dict):
+            return team.get("abbreviation")
+        return team
+
+    home_pts_col, away_pts_col = score_cols
+    long_rows = []
+    for _, row in historical_games.iterrows():
+        local_date = row.get("local_date")
+        if pd.isna(local_date):
+            continue
+        home_abbr = extract_abbr(row.get("homeTeam"))
+        away_abbr = extract_abbr(row.get("awayTeam"))
+        if not home_abbr or not away_abbr:
+            continue
+        home_pts = row.get(home_pts_col)
+        away_pts = row.get(away_pts_col)
+        if pd.isna(home_pts) or pd.isna(away_pts):
+            continue
+        long_rows.append(
+            {"team_abbr": str(home_abbr).upper().strip(), "local_date": local_date,
+             "points_for": home_pts, "points_against": away_pts}
+        )
+        long_rows.append(
+            {"team_abbr": str(away_abbr).upper().strip(), "local_date": local_date,
+             "points_for": away_pts, "points_against": home_pts}
+        )
+    if not long_rows:
+        return pd.DataFrame()
+    long_df = pd.DataFrame(long_rows).sort_values("local_date")
+    grouped = long_df.groupby("team_abbr", group_keys=False)
+    long_df["rolling_points_for"] = grouped["points_for"].apply(
+        lambda s: s.rolling(window=window, min_periods=1).mean().shift(1)
+    )
+    long_df["rolling_points_against"] = grouped["points_against"].apply(
+        lambda s: s.rolling(window=window, min_periods=1).mean().shift(1)
+    )
+    return long_df[["team_abbr", "local_date", "rolling_points_for", "rolling_points_against"]]
+
+
+def time_ordered_split(df, test_size=0.2, date_col=None):
+    if date_col and date_col in df.columns:
+        df = df.sort_values(date_col)
+    split_idx = int(len(df) * (1 - test_size))
+    return df.iloc[:split_idx], df.iloc[split_idx:]
 
 
 def enhance_feature_engineering(games_df, team_stats_df, boxscore_df=None, historical_games=None):
@@ -2122,14 +2203,17 @@ def train_game_prediction_model_with_optuna_cv(merged_features, n_trials=1000):
         "predicted_point_diff_adj"
     ]
     features = [f for f in features if f in merged_features.columns]
-    # Set up the target (use actual scores if available)
-    if "scoring_homeScoreTotal" in merged_features.columns and "scoring_awayScoreTotal" in merged_features.columns:
-        merged_features["actual_point_diff"] = merged_features["scoring_homeScoreTotal"] - merged_features[
-            "scoring_awayScoreTotal"]
-    else:
-        merged_features["actual_point_diff"] = merged_features["predicted_point_diff"]
+    # Set up the target (use actual scores only)
+    if "scoring_homeScoreTotal" not in merged_features.columns or "scoring_awayScoreTotal" not in merged_features.columns:
+        print("Actual game outcomes not available; skipping game model training.")
+        return None, features
+    merged_features["actual_point_diff"] = merged_features["scoring_homeScoreTotal"] - merged_features[
+        "scoring_awayScoreTotal"]
     historical = merged_features.dropna(subset=["actual_point_diff"] + features)
     print("Training data shape:", historical.shape)
+    if historical.empty:
+        print("No historical rows with actual outcomes; skipping game model training.")
+        return None, features
     X = historical[features]
     y = historical["actual_point_diff"]
     print("Correlation of features with actual point diff:")
@@ -2158,25 +2242,11 @@ def train_game_prediction_model_with_optuna_cv(merged_features, n_trials=1000):
     print("Best trial (CV):", study.best_trial.params)
     best_params = study.best_trial.params
 
-    # Build an ensemble stacking pipeline with enhanced preprocessing.
-    from sklearn.ensemble import StackingRegressor
-    from sklearn.linear_model import LinearRegression
-    # Base models remain similar.
-    base_models = [
-        ('xgb', XGBRegressor(**best_params, objective="reg:pseudohubererror", random_state=42)),
-    ]
-    # Use a pipeline that performs robust scaling and a PCA reduction before the regressor.
-    stacking_pipeline = Pipeline([
-        ("scaler", RobustScaler()),
-        ("pca", PCA(n_components=min(len(features), 10))),  # reduce to at most 10 components
-        ("regressor", StackingRegressor(
-            estimators=base_models,
-            final_estimator=LinearRegression()))
-    ])
-    cv_mse = time_series_cv_evaluation(stacking_pipeline, X, y, n_splits=5)
-    print("Stacking Ensemble CV MSE:", cv_mse)
-    stacking_pipeline.fit(X, y)
-    return stacking_pipeline, features
+    model = XGBRegressor(**best_params, objective="reg:pseudohubererror", random_state=42)
+    cv_mse = time_series_cv_evaluation(model, X, y, n_splits=5)
+    print("XGBoost CV MSE:", cv_mse)
+    model.fit(X, y)
+    return model, features
 
 
 def filter_low_minutes_players(df, min_minutes=5):
@@ -2453,6 +2523,34 @@ def feature_engineering(games_df, boxscore_df, playbyplay_df, team_stats_df, his
         lambda abbr: get_team_stat(team_stats_df, abbr, "stats_defense.ptsAgainstPerGame"))
     df["away_team_pts_allowed"] = df["away_team_abbr"].apply(
         lambda abbr: get_team_stat(team_stats_df, abbr, "stats_defense.ptsAgainstPerGame"))
+    rolling_scores = compute_team_rolling_scores(historical_games)
+    if not rolling_scores.empty and "local_date" in df.columns:
+        home_roll = rolling_scores.rename(
+            columns={
+                "team_abbr": "home_team_abbr",
+                "rolling_points_for": "home_team_pts_roll",
+                "rolling_points_against": "home_team_pts_allowed_roll",
+            }
+        )
+        away_roll = rolling_scores.rename(
+            columns={
+                "team_abbr": "away_team_abbr",
+                "rolling_points_for": "away_team_pts_roll",
+                "rolling_points_against": "away_team_pts_allowed_roll",
+            }
+        )
+        df = df.merge(home_roll, on=["home_team_abbr", "local_date"], how="left")
+        df = df.merge(away_roll, on=["away_team_abbr", "local_date"], how="left")
+        df["home_team_pts"] = df["home_team_pts_roll"].combine_first(df["home_team_pts"])
+        df["away_team_pts"] = df["away_team_pts_roll"].combine_first(df["away_team_pts"])
+        df["home_team_pts_allowed"] = df["home_team_pts_allowed_roll"].combine_first(df["home_team_pts_allowed"])
+        df["away_team_pts_allowed"] = df["away_team_pts_allowed_roll"].combine_first(df["away_team_pts_allowed"])
+        df = df.drop(columns=[
+            "home_team_pts_roll",
+            "away_team_pts_roll",
+            "home_team_pts_allowed_roll",
+            "away_team_pts_allowed_roll"
+        ])
     df["home_team_ast"] = df["home_team_abbr"].apply(
         lambda abbr: get_team_stat(team_stats_df, abbr, "stats_offense.astPerGame"))
     df["away_team_ast"] = df["away_team_abbr"].apply(
@@ -2495,38 +2593,55 @@ def train_game_prediction_model_with_optuna(merged_features, n_trials=1000):
         "predicted_point_diff_adj"
     ]
     features = [f for f in features if f in merged_features.columns]
-    if "scoring_homeScoreTotal" in merged_features.columns and "scoring_awayScoreTotal" in merged_features.columns:
-        merged_features["actual_point_diff"] = merged_features["scoring_homeScoreTotal"] - merged_features[
-            "scoring_awayScoreTotal"]
-    else:
-        merged_features["actual_point_diff"] = merged_features["predicted_point_diff"]
+    if "scoring_homeScoreTotal" not in merged_features.columns or "scoring_awayScoreTotal" not in merged_features.columns:
+        print("Actual game outcomes not available; skipping game model training.")
+        return None, features
+    merged_features["actual_point_diff"] = merged_features["scoring_homeScoreTotal"] - merged_features[
+        "scoring_awayScoreTotal"]
     historical = merged_features.dropna(subset=["actual_point_diff"] + features)
     print("Training data shape:", historical.shape)
+    if historical.empty:
+        print("No historical rows with actual outcomes; skipping game model training.")
+        return None, features
     X = historical[features]
     y = historical["actual_point_diff"]
     print("Correlation of features with actual point diff:")
     corr_matrix = historical[features + ["actual_point_diff"]].corr()
     print(corr_matrix["actual_point_diff"].sort_values(ascending=False))
-    X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
     study = optuna.create_study(direction="minimize")
-    study.optimize(lambda trial: optuna_objective(trial, X_train, X_val, y_train, y_val), n_trials=n_trials)
+    study.optimize(lambda trial: time_series_cv_evaluation(
+        XGBRegressor(
+            n_estimators=trial.suggest_int('n_estimators', 500, 2000),
+            max_depth=trial.suggest_int('max_depth', 3, 10),
+            learning_rate=trial.suggest_float('learning_rate', 0.01, 0.3, log=True),
+            subsample=trial.suggest_float('subsample', 0.5, 1.0),
+            colsample_bytree=trial.suggest_float('colsample_bytree', 0.5, 1.0),
+            gamma=trial.suggest_float('gamma', 0, 5),
+            min_child_weight=trial.suggest_int('min_child_weight', 1, 10),
+            reg_alpha=trial.suggest_float('reg_alpha', 0, 1),
+            reg_lambda=trial.suggest_float('reg_lambda', 0, 1),
+            objective="reg:pseudohubererror",
+            random_state=42
+        ),
+        X,
+        y,
+        n_splits=5
+    ), n_trials=n_trials)
     print("Best trial:", study.best_trial.params)
     best_params = study.best_trial.params
     ensemble_models = []
     n_models = 10
     for seed in range(n_models):
         model = XGBRegressor(**best_params, objective="reg:pseudohubererror", random_state=42 + seed)
-        pipeline = Pipeline([("scaler", StandardScaler()), ("xgb", model)])
-        pipeline.fit(X_train, y_train)
-        ensemble_models.append(pipeline)
+        model.fit(X, y)
+        ensemble_models.append(model)
 
     def ensemble_predict(X):
         preds = np.mean([model.predict(X) for model in ensemble_models], axis=0)
         return preds
 
-    y_pred_ensemble = ensemble_predict(X_val)
-    mse_ensemble = mean_squared_error(y_val, y_pred_ensemble)
-    print("Ensemble Validation MSE:", mse_ensemble)
+    cv_mse = time_series_cv_evaluation(ensemble_models[0], X, y, n_splits=5)
+    print("Ensemble CV MSE:", cv_mse)
     return ensemble_predict, features
 
 
@@ -2560,6 +2675,8 @@ def train_player_stats_model(player_stats_df, daily_player_gamelogs_df, injuries
         stats_flat = pd.json_normalize(df["stats"]).add_prefix("stats_")
         df = df.drop(columns=["stats"]).reset_index(drop=True)
         df = pd.concat([df, stats_flat], axis=1)
+    if "game.startTime" in df.columns and "game_date" not in df.columns:
+        df["game_date"] = pd.to_datetime(df["game.startTime"], errors="coerce")
     if "player_id" not in df.columns:
         df["player_id"] = df["player"].apply(lambda x: x.get("id") if isinstance(x, dict) else x)
     print("Player stats dataframe shape after loading:", df.shape)
@@ -2600,7 +2717,6 @@ def train_player_stats_model(player_stats_df, daily_player_gamelogs_df, injuries
         "stats_freeThrows.ftAttPerGame",
         "stats_freeThrows.ftMadePerGame",
         "stats_freeThrows.ftPct",
-        "stats_rebounds.rebPerGame",
         "stats_rebounds.offRebPerGame",
         "stats_rebounds.defRebPerGame",
         "weighted_rolling_pts",
@@ -2632,7 +2748,15 @@ def train_player_stats_model(player_stats_df, daily_player_gamelogs_df, injuries
     print("Final training dataframe shape for player model:", df.shape)
     X = df[available_features]
     y = df[target_columns]
-    X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
+    train_df, val_df = time_ordered_split(df, test_size=0.2, date_col="game_date")
+    if train_df.empty or val_df.empty:
+        logging.warning("Insufficient ordered data for validation split; using full dataset for training.")
+        train_df = df
+        val_df = df
+    X_train = train_df[available_features]
+    y_train = train_df[target_columns]
+    X_val = val_df[available_features]
+    y_val = val_df[target_columns]
     from sklearn.multioutput import MultiOutputRegressor
     player_model = MultiOutputRegressor(
         XGBRegressor(objective="reg:pseudohubererror", n_estimators=500, learning_rate=0.01, random_state=42))
@@ -2791,10 +2915,6 @@ def add_rest_features(games_df, historical_games):
     return games_df
 
 
-def compute_win_probability(predicted_point_diff, scale=10.0):
-    return 1.0 / (1.0 + np.exp(-predicted_point_diff / scale))
-
-
 def kelly_criterion(probability, odds, fraction=1.0):
     edge = (probability * (odds - 1)) - (1 - probability)
     if edge <= 0:
@@ -2823,24 +2943,6 @@ def fetch_daily_player_gamelogs_for_teams(season, date_obj, teams):
     return df_logs
 
 
-def optuna_objective(trial, X_train, X_val, y_train, y_val):
-    params = {
-        'n_estimators': trial.suggest_int('n_estimators', 500, 2000),
-        'max_depth': trial.suggest_int('max_depth', 3, 10),
-        'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.3, log=True),
-        'subsample': trial.suggest_float('subsample', 0.5, 1.0),
-        'colsample_bytree': trial.suggest_float('colsample_bytree', 0.5, 1.0),
-        'gamma': trial.suggest_float('gamma', 0, 5),
-        'min_child_weight': trial.suggest_int('min_child_weight', 1, 10),
-        'reg_alpha': trial.suggest_float('reg_alpha', 0, 1),
-        'reg_lambda': trial.suggest_float('reg_lambda', 0, 1)
-    }
-    model = XGBRegressor(**params, objective="reg:pseudohubererror", random_state=42)
-    model.fit(X_train, y_train)
-    y_pred = model.predict(X_val)
-    return mean_squared_error(y_val, y_pred)
-
-
 def train_individual_models(X, y, trial):
     models = {}
     params = {
@@ -2857,19 +2959,14 @@ def train_individual_models(X, y, trial):
     return models
 
 
-import optuna
-from sklearn.multioutput import MultiOutputRegressor
-from sklearn.metrics import mean_squared_error
-from sklearn.model_selection import train_test_split
-from xgboost import XGBRegressor
-
-
 def train_player_stats_model_with_optuna(player_stats_df, daily_player_gamelogs_df, injuries_df, team_stats_df,
                                          games_df, n_trials=10000, n_jobs=4):
     df = player_stats_df.copy()
     if "stats" in df.columns:
         stats_flat = pd.json_normalize(df["stats"]).add_prefix("stats_")
         df = pd.concat([df.drop(columns=["stats"]), stats_flat], axis=1)
+    if "game.startTime" in df.columns and "game_date" not in df.columns:
+        df["game_date"] = pd.to_datetime(df["game.startTime"], errors="coerce")
     if "player_id" not in df.columns:
         df["player_id"] = df["player"].apply(lambda x: x.get("id") if isinstance(x, dict) else x)
     print("Player stats dataframe shape after loading:", df.shape)
@@ -2910,7 +3007,6 @@ def train_player_stats_model_with_optuna(player_stats_df, daily_player_gamelogs_
         "stats_freeThrows.ftAttPerGame",
         "stats_freeThrows.ftMadePerGame",
         "stats_freeThrows.ftPct",
-        "stats_rebounds.rebPerGame",
         "stats_rebounds.offRebPerGame",
         "stats_rebounds.defRebPerGame",
         "weighted_rolling_pts",
@@ -2942,7 +3038,15 @@ def train_player_stats_model_with_optuna(player_stats_df, daily_player_gamelogs_
     print("Final training dataframe shape for player model:", df.shape)
     X = df[available_features]
     y = df[target_columns]
-    X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
+    train_df, val_df = time_ordered_split(df, test_size=0.2, date_col="game_date")
+    if train_df.empty or val_df.empty:
+        logging.warning("Insufficient ordered data for validation split; using full dataset for training.")
+        train_df = df
+        val_df = df
+    X_train = train_df[available_features]
+    y_train = train_df[target_columns]
+    X_val = val_df[available_features]
+    y_val = val_df[target_columns]
     from sklearn.multioutput import MultiOutputRegressor
     player_model = MultiOutputRegressor(
         XGBRegressor(objective="reg:pseudohubererror", n_estimators=500, learning_rate=0.01, random_state=42))
@@ -3257,6 +3361,7 @@ def main():
     print("Today's features shape:", merged_features_today.shape)
     game_model, game_features = train_game_prediction_model_with_optuna_cv(merged_features_hist, n_trials=1000)
     if game_model is not None:
+        nba_odds = get_nba_odds()  # fetch actual game odds
         X_today = merged_features_today[game_features].fillna(0)
         if X_today.shape[0] == 0:
             print("No games found for today's slate after feature prep; skipping game predictions.")
@@ -3276,11 +3381,11 @@ def main():
         merged_features_today["predicted_away_score"] = merged_features_today.get("away_team_pts",
                                                                                   0) - combined_preds_capped / 2
         print(
-            "Game prediction models (stacking ensemble and NN) trained. Predictions for today's games updated with combined model.")
+            "Game prediction models (XGBoost and NN) trained. Predictions for today's games updated with combined model.")
         perform_residual_analysis(merged_features_hist, historical_preds)
         backtest_betting_strategy(merged_features_hist, game_model, game_features,
                                   {"player_points": 3.5, "player_assists": 2.5, "player_rebounds": 2.5,
-                                   "player_threes": 2.5})
+                                   "player_threes": 2.5}, nba_odds)
         schedule_retraining()
     else:
         print("Game-level model training was skipped; using pre-game predictions.")

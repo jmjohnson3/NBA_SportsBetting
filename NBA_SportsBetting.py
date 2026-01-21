@@ -76,6 +76,7 @@ PLAYBOOK_MENTION = f"<@!{PLAYBOOK_USER_ID}>"
 DISCORD_BOT_TOKEN = "MTM4MDYyMzgxMzQyNzA3MzA5NQ.GAoVyL.3_TfETbDKOlqUGEYhLOE3GI6nYljZxflTENE2w"
 DISCORD_CHANNEL_ID = "1461420980260831253"
 ODDS_INGEST_LOOKBACK_DAYS = 120
+PROPS_INGEST_LOOKBACK_DAYS = 30
 
 session = None
 api_cache_initialized = False
@@ -1835,6 +1836,32 @@ def init_mysportsfeeds_odds_table():
             )
 
 
+def init_player_props_history_table():
+    conn = get_db_connection()
+    with conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS player_props_history (
+                    id SERIAL PRIMARY KEY,
+                    game_date DATE NOT NULL,
+                    player_name TEXT NOT NULL,
+                    market TEXT NOT NULL,
+                    line NUMERIC,
+                    source TEXT,
+                    payload JSONB,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_player_props_history_unique
+                ON player_props_history (game_date, player_name, market, source)
+                """
+            )
+
+
 def fetch_mysportsfeeds_game_odds(season, date_obj):
     date_str = date_obj.strftime("%Y%m%d")
     url = (
@@ -1965,6 +1992,51 @@ def normalize_prop_market(market: str | None) -> str | None:
         "player_threes": "player_threes",
     }
     return mapping.get(cleaned, cleaned)
+
+
+def parse_props_key(key: str):
+    if not key:
+        return None, None
+    known_market_suffixes = ("player_points", "player_assists", "player_rebounds", "player_threes")
+    for suffix in known_market_suffixes:
+        if key.endswith(f"_{suffix}"):
+            name_part = key[:-(len(suffix) + 1)]
+            return name_part, suffix
+    return None, None
+
+
+def store_player_props_history(props_odds, game_date, source="odds_api"):
+    if not props_odds:
+        return 0
+    init_player_props_history_table()
+    conn = get_db_connection()
+    inserted = 0
+    with conn:
+        with conn.cursor() as cursor:
+            for key, line in props_odds.items():
+                name_part, market = parse_props_key(key)
+                if not name_part or not market:
+                    continue
+                player_name = normalize_player_name(name_part)
+                if not player_name:
+                    continue
+                cursor.execute(
+                    """
+                    INSERT INTO player_props_history (game_date, player_name, market, line, source, payload)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (game_date, player_name, market, source) DO NOTHING
+                    """,
+                    (
+                        game_date,
+                        player_name,
+                        market,
+                        line,
+                        source,
+                        psycopg2.extras.Json({"key": key, "line": line})
+                    )
+                )
+                inserted += cursor.rowcount
+    return inserted
 
 
 def compute_implied_prob_from_american(price):
@@ -3827,7 +3899,8 @@ def main():
         "game_backtest_ran": False,
         "prop_backtest_ran": False,
         "historical_prop_rows": 0,
-        "odds_rows_ingested": 0
+        "odds_rows_ingested": 0,
+        "props_rows_ingested": 0
     }
     game_model, game_features = train_game_prediction_model_with_optuna_cv(merged_features_hist, n_trials=10)
     if game_model is not None:
@@ -3944,6 +4017,10 @@ def main():
         print("Player stats model training failed.")
     global props_odds
     props_odds = get_all_player_props_odds(nba_odds)
+    props_inserted = store_player_props_history(props_odds, TARGET_DATE)
+    if props_inserted:
+        print(f"Stored {props_inserted} player props rows for {TARGET_DATE}.")
+    readiness["props_rows_ingested"] += props_inserted
     thresholds = {"player_points": 3.5, "player_assists": 2.5, "player_rebounds": 2.5, "player_threes": 2.5}
     player_team_map = {}
     for _, row in player_stats_ready_df.iterrows():
@@ -3997,10 +4074,19 @@ def main():
             f"{PLAYBOOK_MENTION} No 100% alt-line hits found over the last 10 games ending "
             f"{alt_cutoff}."
         )
-    print_game_and_player_predictions(merged_features_today, player_stats_ready_df, player_model, feat_cols,
-                                      target_cols, nba_odds, props_odds, thresholds, team_stats_df)
-    build_html_predictions(merged_features_today, player_stats_ready_df, player_model, feat_cols, target_cols,
-                           nba_odds, props_odds, thresholds, team_stats_df)
+    readiness_ok = (
+        readiness["has_actual_outcomes"]
+        and readiness["game_backtest_ran"]
+        and readiness["prop_backtest_ran"]
+        and readiness["historical_prop_rows"] > 0
+    )
+    if readiness_ok:
+        print_game_and_player_predictions(merged_features_today, player_stats_ready_df, player_model, feat_cols,
+                                          target_cols, nba_odds, props_odds, thresholds, team_stats_df)
+        build_html_predictions(merged_features_today, player_stats_ready_df, player_model, feat_cols, target_cols,
+                               nba_odds, props_odds, thresholds, team_stats_df)
+    else:
+        print("Skipping betting outputs because readiness checks are incomplete.")
     print("\n=== Readiness Report ===")
     for key, value in readiness.items():
         print(f"{key}: {value}")

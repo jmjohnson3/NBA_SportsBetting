@@ -28,6 +28,7 @@ from jinja2 import Template
 import aiohttp
 from scipy.stats import norm
 from sklearn.cluster import KMeans
+from sklearn.base import clone
 
 # For scaling pipeline and ensemble (if desired)
 from sklearn.preprocessing import RobustScaler
@@ -323,7 +324,9 @@ def backtest_betting_strategy(historical_df, model, game_features, betting_thres
         print("Insufficient data for out-of-sample backtesting.")
         return
     X_train = train_df[game_features].fillna(0)
-    train_preds = model.predict(X_train)
+    fitted_model = clone(model)
+    fitted_model.fit(X_train, train_df["actual_point_diff"])
+    train_preds = fitted_model.predict(X_train)
     train_actuals = (train_df["actual_point_diff"] > 0).astype(int).values
     train_probs = compute_win_probability(train_preds)
     _, calibrator = calibrate_win_probabilities(train_probs, train_actuals)
@@ -332,7 +335,7 @@ def backtest_betting_strategy(historical_df, model, game_features, betting_thres
     bets = 0
     for idx, row in eval_df.iterrows():
         X = pd.DataFrame([row[game_features].fillna(0)])
-        pred_diff = model.predict(X)[0]
+        pred_diff = fitted_model.predict(X)[0]
         raw_prob = compute_win_probability(pred_diff)
         win_prob = calibrator.predict([raw_prob])[0]
         sportsbook_odds = eval_odds[eval_df.index.get_loc(idx)]

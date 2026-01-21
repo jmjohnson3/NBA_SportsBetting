@@ -3359,6 +3359,14 @@ def main():
     print("Final today's features shape:", merged_features_today.shape)
     print("Historical features shape:", merged_features_hist.shape)
     print("Today's features shape:", merged_features_today.shape)
+    has_actuals = (
+        "scoring_homeScoreTotal" in merged_features_hist.columns
+        and "scoring_awayScoreTotal" in merged_features_hist.columns
+    )
+    if has_actuals:
+        merged_features_hist["actual_point_diff"] = (
+            merged_features_hist["scoring_homeScoreTotal"] - merged_features_hist["scoring_awayScoreTotal"]
+        )
     game_model, game_features = train_game_prediction_model_with_optuna_cv(merged_features_hist, n_trials=10)
     if game_model is not None:
         nba_odds = get_nba_odds()  # fetch actual game odds
@@ -3366,12 +3374,14 @@ def main():
         if X_today.shape[0] == 0:
             print("No games found for today's slate after feature prep; skipping game predictions.")
             return
-        X_hist = merged_features_hist[game_features].fillna(0).values
-        y_hist = merged_features_hist["actual_point_diff"].values
-        nn_model = train_nn_game_model(X_hist, y_hist, epochs=200, batch_size=64)
         ensemble_preds = game_model.predict(X_today)
-        nn_preds = nn_model.predict(X_today.values).flatten()
-        combined_preds = (ensemble_preds + nn_preds) / 2.0
+        combined_preds = ensemble_preds
+        if has_actuals:
+            X_hist = merged_features_hist[game_features].fillna(0).values
+            y_hist = merged_features_hist["actual_point_diff"].values
+            nn_model = train_nn_game_model(X_hist, y_hist, epochs=200, batch_size=64)
+            nn_preds = nn_model.predict(X_today.values).flatten()
+            combined_preds = (ensemble_preds + nn_preds) / 2.0
         historical_preds = game_model.predict(merged_features_hist[game_features].fillna(0))
         residuals = perform_residual_analysis(merged_features_hist, historical_preds)
         combined_preds_capped = cap_extreme_predictions(combined_preds, residuals, threshold=3)
@@ -3383,37 +3393,46 @@ def main():
         print(
             "Game prediction models (XGBoost and NN) trained. Predictions for today's games updated with combined model.")
         perform_residual_analysis(merged_features_hist, historical_preds)
-        backtest_betting_strategy(merged_features_hist, game_model, game_features,
-                                  {"player_points": 3.5, "player_assists": 2.5, "player_rebounds": 2.5,
-                                   "player_threes": 2.5}, nba_odds)
+        if has_actuals:
+            backtest_betting_strategy(merged_features_hist, game_model, game_features,
+                                      {"player_points": 3.5, "player_assists": 2.5, "player_rebounds": 2.5,
+                                       "player_threes": 2.5}, nba_odds)
+        else:
+            print("Skipping backtest due to missing actual outcomes.")
         schedule_retraining()
     else:
         print("Game-level model training was skipped; using pre-game predictions.")
 
     # --- AutoML Integration ---
-    try:
-        X_hist = merged_features_hist[game_features].fillna(0).values
-        y_hist = merged_features_hist["actual_point_diff"].values
-        auto_model, automl_history = train_autokeras_game_model(X_hist, y_hist, max_trials=3, epochs=30)
-        auto_preds = auto_model.predict(merged_features_today[game_features].fillna(0).values).flatten()
-        print("AutoML model predictions (first 5):", auto_preds[:5])
-    except Exception as e:
-        print("AutoML model training failed, using previous ensemble. Error:", e)
+    if has_actuals:
+        try:
+            X_hist = merged_features_hist[game_features].fillna(0).values
+            y_hist = merged_features_hist["actual_point_diff"].values
+            auto_model, automl_history = train_autokeras_game_model(X_hist, y_hist, max_trials=3, epochs=30)
+            auto_preds = auto_model.predict(merged_features_today[game_features].fillna(0).values).flatten()
+            print("AutoML model predictions (first 5):", auto_preds[:5])
+        except Exception as e:
+            print("AutoML model training failed, using previous ensemble. Error:", e)
+    else:
+        print("Skipping AutoML training due to missing actual outcomes.")
 
     nba_odds = get_nba_odds()  # fetch actual game odds
 
     # --- Reinforcement Learning Integration ---
     # For demonstration, we create dummy arrays (from historical predictions) as input to the RL environment.
     dummy_predictions = merged_features_hist["predicted_point_diff"].fillna(0).values
-    dummy_actuals = merged_features_hist["actual_point_diff"].fillna(0).values
-    # Use the new assign_game_odds to get an array of odds corresponding to each historical game.
-    actual_odds = assign_game_odds(merged_features_hist, nba_odds, default_odds=2.0)
+    if has_actuals:
+        dummy_actuals = merged_features_hist["actual_point_diff"].fillna(0).values
+        # Use the new assign_game_odds to get an array of odds corresponding to each historical game.
+        actual_odds = assign_game_odds(merged_features_hist, nba_odds, default_odds=2.0)
 
-    try:
-        rl_agent = train_rl_agent_for_betting(dummy_predictions, dummy_actuals, actual_odds, total_timesteps=1000)
-        print("RL agent trained for betting adjustment using realistic odds.")
-    except Exception as e:
-        print("RL agent training failed. Error:", e)
+        try:
+            rl_agent = train_rl_agent_for_betting(dummy_predictions, dummy_actuals, actual_odds, total_timesteps=1000)
+            print("RL agent trained for betting adjustment using realistic odds.")
+        except Exception as e:
+            print("RL agent training failed. Error:", e)
+    else:
+        print("Skipping RL agent training due to missing actual outcomes.")
 
     games_df["home_team_abbr"] = games_df["homeTeam"].apply(
         lambda x: x.get("abbreviation").upper().strip() if isinstance(x, dict) else str(x).upper().strip())

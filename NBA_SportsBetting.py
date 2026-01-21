@@ -1346,7 +1346,8 @@ def compute_alt_lines_from_recent_games(player_gamelogs_df, games_today_df=None,
                                         cutoff_date: date | None = None, teams_filter=None,
                                         player_team_map=None, include_under: bool = False,
                                         min_alt_line: float = 0.5,
-                                        min_alt_lines_by_market: dict | None = None):
+                                        min_alt_lines_by_market: dict | None = None,
+                                        predicted_stats_by_player: dict | None = None):
     if player_gamelogs_df.empty:
         logging.info("No player gamelogs available for alternative line evaluation.")
         return [], {}
@@ -1494,6 +1495,9 @@ def compute_alt_lines_from_recent_games(player_gamelogs_df, games_today_df=None,
         game_key = game_lookup.get(team_abbr) if team_abbr else None
         if not game_key:
             game_key = f"{team_abbr or 'All Games'}"
+        predicted_stats = None
+        if predicted_stats_by_player is not None:
+            predicted_stats = predicted_stats_by_player.get(player_name_upper)
         for market, stat_col in market_cols.items():
             stat_values = pd.to_numeric(last_games[stat_col], errors="coerce")
             if stat_values.isna().any():
@@ -1504,7 +1508,14 @@ def compute_alt_lines_from_recent_games(player_gamelogs_df, games_today_df=None,
             alt_under_line = max_value + 0.5
             market_label = market.replace("player_", "").replace("_", " ").title()
             min_market_line = max(min_alt_line, min_alt_lines_by_market.get(market, min_alt_line))
-            if alt_over_line >= min_market_line:
+            predicted_value = None
+            if predicted_stats is not None:
+                predicted_value = predicted_stats.get(market)
+                if predicted_value is None:
+                    continue
+            if alt_over_line >= min_market_line and (
+                predicted_value is None or predicted_value >= alt_over_line
+            ):
                 alt_hit_rate_bets.append({
                     "game": game_key,
                     "player": player_name,
@@ -1516,7 +1527,9 @@ def compute_alt_lines_from_recent_games(player_gamelogs_df, games_today_df=None,
                     format_alt_hit_rate_bet(player_name, market, alt_over_line, "over", window)
                 )
             if include_under:
-                if alt_under_line >= min_market_line:
+                if alt_under_line >= min_market_line and (
+                    predicted_value is None or predicted_value <= alt_under_line
+                ):
                     alt_hit_rate_bets.append({
                         "game": game_key,
                         "player": player_name,
@@ -1530,6 +1543,61 @@ def compute_alt_lines_from_recent_games(player_gamelogs_df, games_today_df=None,
     print(f"Alt-line scan produced {qualified_players} players with {window} games.")
     print(f"Alt-line scan produced {len(alt_hit_rate_bets)} bets.")
     return alt_hit_rate_bets, alt_hit_rate_bets_by_game
+
+
+def build_player_prediction_map(player_stats_df, player_model, features, targets, games_today_df, team_stats_df):
+    if player_model is None or player_stats_df.empty:
+        return {}
+    opponent_lookup = {}
+    if games_today_df is not None and not games_today_df.empty:
+        for _, game in games_today_df.iterrows():
+            home_abbr = game.get("home_team_abbr")
+            away_abbr = game.get("away_team_abbr")
+            if not home_abbr or not away_abbr:
+                home_team = game.get("homeTeam")
+                away_team = game.get("awayTeam")
+                home_abbr = home_team.get("abbreviation") if isinstance(home_team, dict) else home_team
+                away_abbr = away_team.get("abbreviation") if isinstance(away_team, dict) else away_team
+            home_abbr = normalize_team_abbr(home_abbr) if home_abbr else None
+            away_abbr = normalize_team_abbr(away_abbr) if away_abbr else None
+            if home_abbr and away_abbr:
+                opponent_lookup[home_abbr] = away_abbr
+                opponent_lookup[away_abbr] = home_abbr
+
+    market_to_pred_key = {
+        "player_points": "stats_offense.ptsPerGame",
+        "player_assists": "stats_offense.astPerGame",
+        "player_rebounds": "stats_rebounds.rebPerGame"
+    }
+    predictions = {}
+    for _, player in player_stats_df.iterrows():
+        player_info = player.get("player")
+        name = (
+            f"{player_info.get('firstName', '')} {player_info.get('lastName', '')}".strip()
+            if isinstance(player_info, dict)
+            else str(player_info).strip()
+        )
+        name_upper = normalize_player_name(name)
+        if not name_upper:
+            continue
+        X_player = pd.DataFrame([player[features].fillna(0)])
+        preds = player_model.predict(X_player)[0]
+        pred_dict = dict(zip(targets, preds))
+        predicted_points = pred_dict.get(market_to_pred_key["player_points"], 0)
+        team_abbr = player.get("team_abbr")
+        team_abbr = normalize_team_abbr(team_abbr) if team_abbr else None
+        opponent_abbr = opponent_lookup.get(team_abbr)
+        player_position = player_info.get("position") if isinstance(player_info, dict) else None
+        if opponent_abbr:
+            predicted_points = adjust_player_prop_for_defense(
+                predicted_points, opponent_abbr, player_position, team_stats_df
+            )
+        predictions[name_upper] = {
+            "player_points": predicted_points,
+            "player_assists": pred_dict.get(market_to_pred_key["player_assists"], 0),
+            "player_rebounds": pred_dict.get(market_to_pred_key["player_rebounds"], 0)
+        }
+    return predictions
 
 
 def get_teams_with_games(games_df, target_date):
@@ -3281,6 +3349,14 @@ def main():
         team_abbr = row.get("team_abbr")
         if normalized_name and team_abbr:
             player_team_map[normalized_name] = normalize_team_abbr(team_abbr)
+    predicted_stats_by_player = build_player_prediction_map(
+        player_stats_ready_df,
+        player_model,
+        feat_cols,
+        target_cols,
+        games_today_df,
+        team_stats_df
+    )
     alt_cutoff = TARGET_DATE - timedelta(days=1)
     db_player_gamelogs = fetch_player_gamelogs_from_db(alt_cutoff)
     gamelog_source = db_player_gamelogs if not db_player_gamelogs.empty else seasonal_player_gamelogs
@@ -3295,7 +3371,8 @@ def main():
         cutoff_date=alt_cutoff,
         teams_filter=None,
         player_team_map=player_team_map,
-        include_under=False
+        include_under=False,
+        predicted_stats_by_player=predicted_stats_by_player
     )
     print_alt_hit_rate_bets(alt_hit_rate_bets, window=10)
     if alt_hit_rate_bets_by_game:

@@ -1810,12 +1810,18 @@ def compute_perfect_hit_rate_bets(player_gamelogs_df, props_odds, games_today_df
     if player_team_map is None:
         player_team_map = {}
     normalized_props = {}
+    known_market_suffixes = ("player_points", "player_assists", "player_rebounds", "player_threes")
     for key, value in props_odds.items():
         if not key:
             continue
-        try:
-            name_part, market = key.rsplit("_", 1)
-        except ValueError:
+        market = None
+        name_part = None
+        for suffix in known_market_suffixes:
+            if key.endswith(f"_{suffix}"):
+                market = suffix
+                name_part = key[:-(len(suffix) + 1)]
+                break
+        if market is None or not name_part:
             continue
         normalized_name = normalize_player_name(name_part)
         if not normalized_name:

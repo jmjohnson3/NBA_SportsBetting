@@ -305,7 +305,7 @@ def schedule_retraining():
 
 
 def backtest_betting_strategy(historical_df, model, game_features, betting_thresholds, nba_odds,
-                              default_odds=2.0, date_col="local_date"):
+                              msf_odds_df=None, default_odds=2.0, date_col="local_date"):
     """
     Backtest the betting strategy on historical data with an out-of-sample split.
     """
@@ -331,6 +331,10 @@ def backtest_betting_strategy(historical_df, model, game_features, betting_thres
     train_probs = compute_win_probability(train_preds)
     _, calibrator = calibrate_win_probabilities(train_probs, train_actuals)
     eval_odds = assign_game_odds(eval_df, nba_odds, default_odds=default_odds)
+    if msf_odds_df is not None and not msf_odds_df.empty:
+        eval_odds, fair_probs = assign_game_odds_with_hold(eval_df, msf_odds_df, default_odds=default_odds)
+    else:
+        fair_probs = np.array([None] * len(eval_df))
     total_return = 0
     bets = 0
     for idx, row in eval_df.iterrows():
@@ -339,7 +343,11 @@ def backtest_betting_strategy(historical_df, model, game_features, betting_thres
         raw_prob = compute_win_probability(pred_diff)
         win_prob = calibrator.predict([raw_prob])[0]
         sportsbook_odds = eval_odds[eval_df.index.get_loc(idx)]
-        kelly = compute_betting_edge(win_prob, sportsbook_odds)
+        fair_prob = fair_probs[eval_df.index.get_loc(idx)]
+        if fair_prob is not None and win_prob <= fair_prob:
+            kelly = 0.0
+        else:
+            kelly = compute_betting_edge(win_prob, sportsbook_odds)
         bet_result = sportsbook_odds - 1 if row.get("actual_point_diff", 0) > 0 else -1
         total_return += kelly * bet_result
         bets += 1
@@ -1799,6 +1807,111 @@ def fetch_player_gamelogs_from_db(cutoff_date: date | None = None) -> pd.DataFra
     return db_df
 
 
+def init_mysportsfeeds_odds_table():
+    conn = get_db_connection()
+    with conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS mysportsfeeds_game_odds (
+                    id SERIAL PRIMARY KEY,
+                    game_date DATE NOT NULL,
+                    home_team_abbr TEXT NOT NULL,
+                    away_team_abbr TEXT NOT NULL,
+                    home_moneyline NUMERIC,
+                    away_moneyline NUMERIC,
+                    bookmaker TEXT,
+                    payload JSONB,
+                    fetched_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_msf_game_odds_unique
+                ON mysportsfeeds_game_odds (game_date, home_team_abbr, away_team_abbr, bookmaker)
+                """
+            )
+
+
+def fetch_mysportsfeeds_game_odds(season, date_obj):
+    date_str = date_obj.strftime("%Y%m%d")
+    url = (
+        f"https://api.mysportsfeeds.com/v2.1/pull/nba/{season}-regular/date/{date_str}/odds_gamelines.json"
+    )
+    payload = fetch_api_data(url)
+    if not payload or not isinstance(payload, dict):
+        return []
+    game_lines = payload.get("gameLines") or payload.get("gamelines") or []
+    rows = []
+    for entry in game_lines:
+        if not isinstance(entry, dict):
+            continue
+        game = entry.get("game", {})
+        home_team = game.get("homeTeam", {}) if isinstance(game, dict) else {}
+        away_team = game.get("awayTeam", {}) if isinstance(game, dict) else {}
+        home_abbr = home_team.get("abbreviation") or game.get("homeTeamAbbreviation")
+        away_abbr = away_team.get("abbreviation") or game.get("awayTeamAbbreviation")
+        if not home_abbr or not away_abbr:
+            continue
+        home_moneyline = entry.get("homeMoneyline") or entry.get("homeLine")
+        away_moneyline = entry.get("awayMoneyline") or entry.get("awayLine")
+        bookmaker = entry.get("sportsbook") or entry.get("bookmaker")
+        rows.append({
+            "game_date": date_obj,
+            "home_team_abbr": str(home_abbr).upper().strip(),
+            "away_team_abbr": str(away_abbr).upper().strip(),
+            "home_moneyline": home_moneyline,
+            "away_moneyline": away_moneyline,
+            "bookmaker": bookmaker,
+            "payload": entry
+        })
+    return rows
+
+
+def store_mysportsfeeds_game_odds(rows):
+    if not rows:
+        return 0
+    init_mysportsfeeds_odds_table()
+    conn = get_db_connection()
+    inserted = 0
+    with conn:
+        with conn.cursor() as cursor:
+            for row in rows:
+                cursor.execute(
+                    """
+                    INSERT INTO mysportsfeeds_game_odds (
+                        game_date, home_team_abbr, away_team_abbr, home_moneyline, away_moneyline, bookmaker, payload
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (game_date, home_team_abbr, away_team_abbr, bookmaker) DO NOTHING
+                    """,
+                    (
+                        row["game_date"],
+                        row["home_team_abbr"],
+                        row["away_team_abbr"],
+                        row["home_moneyline"],
+                        row["away_moneyline"],
+                        row["bookmaker"],
+                        psycopg2.extras.Json(row["payload"])
+                    )
+                )
+                inserted += cursor.rowcount
+    return inserted
+
+
+def fetch_mysportsfeeds_game_odds_from_db(start_date, end_date):
+    init_mysportsfeeds_odds_table()
+    conn = get_db_connection()
+    query = """
+        SELECT game_date, home_team_abbr, away_team_abbr, home_moneyline, away_moneyline, bookmaker
+        FROM mysportsfeeds_game_odds
+        WHERE game_date BETWEEN %s AND %s
+        ORDER BY game_date ASC
+    """
+    return pd.read_sql_query(query, conn, params=(start_date, end_date))
+
+
 def normalize_prop_market(market: str | None) -> str | None:
     if not market:
         return None
@@ -1842,6 +1955,29 @@ def compute_fair_prob_over(over_price, under_price):
     if total == 0:
         return None
     return over_prob / total
+
+
+def compute_decimal_odds_from_american(price):
+    try:
+        price = float(price)
+    except (TypeError, ValueError):
+        return None
+    if price == 0:
+        return None
+    if price < 0:
+        return 1 + (100 / abs(price))
+    return 1 + (price / 100)
+
+
+def compute_fair_prob_two_sided(home_price, away_price):
+    home_prob = compute_implied_prob_from_american(home_price)
+    away_prob = compute_implied_prob_from_american(away_price)
+    if home_prob is None or away_prob is None:
+        return None
+    total = home_prob + away_prob
+    if total == 0:
+        return None
+    return home_prob / total
 
 
 def fetch_historical_props_from_db(cutoff_date: date | None = None) -> pd.DataFrame:
@@ -2297,6 +2433,38 @@ def assign_game_odds(merged_features, nba_odds, default_odds=2.0):
         else:
             odds_array.append(default_odds)
     return np.array(odds_array)
+
+
+def assign_game_odds_with_hold(merged_features, msf_odds_df, default_odds=2.0):
+    odds_array = []
+    fair_prob_array = []
+    if msf_odds_df is None or msf_odds_df.empty:
+        return np.array(odds_array), np.array(fair_prob_array)
+    for _, row in merged_features.iterrows():
+        home_team = row.get("home_team_abbr")
+        away_team = row.get("away_team_abbr")
+        game_date = row.get("local_date")
+        if pd.isna(game_date):
+            odds_array.append(default_odds)
+            fair_prob_array.append(None)
+            continue
+        match = msf_odds_df[
+            (msf_odds_df["game_date"] == pd.to_datetime(game_date).date())
+            & (msf_odds_df["home_team_abbr"] == str(home_team).upper().strip())
+            & (msf_odds_df["away_team_abbr"] == str(away_team).upper().strip())
+        ]
+        if match.empty:
+            odds_array.append(default_odds)
+            fair_prob_array.append(None)
+            continue
+        entry = match.iloc[0]
+        home_moneyline = entry.get("home_moneyline")
+        away_moneyline = entry.get("away_moneyline")
+        sportsbook_odds = compute_decimal_odds_from_american(home_moneyline) or default_odds
+        fair_prob = compute_fair_prob_two_sided(home_moneyline, away_moneyline)
+        odds_array.append(sportsbook_odds)
+        fair_prob_array.append(fair_prob)
+    return np.array(odds_array), np.array(fair_prob_array)
 
 
 
@@ -3624,6 +3792,10 @@ def main():
     game_model, game_features = train_game_prediction_model_with_optuna_cv(merged_features_hist, n_trials=10)
     if game_model is not None:
         nba_odds = get_nba_odds()  # fetch actual game odds
+        odds_rows = fetch_mysportsfeeds_game_odds(seasons[-1], TARGET_DATE)
+        inserted = store_mysportsfeeds_game_odds(odds_rows)
+        if inserted:
+            print(f"Stored {inserted} MySportsFeeds game odds rows for {TARGET_DATE}.")
         X_today = merged_features_today[game_features].fillna(0)
         if X_today.shape[0] == 0:
             print("No games found for today's slate after feature prep; skipping game predictions.")
@@ -3648,9 +3820,13 @@ def main():
             "Game prediction models (XGBoost and NN) trained. Predictions for today's games updated with combined model.")
         perform_residual_analysis(merged_features_hist, historical_preds)
         if has_actuals:
+            msf_odds_df = fetch_mysportsfeeds_game_odds_from_db(
+                merged_features_hist["local_date"].min(),
+                merged_features_hist["local_date"].max()
+            )
             backtest_betting_strategy(merged_features_hist, game_model, game_features,
                                       {"player_points": 3.5, "player_assists": 2.5, "player_rebounds": 2.5,
-                                       "player_threes": 2.5}, nba_odds)
+                                       "player_threes": 2.5}, nba_odds, msf_odds_df=msf_odds_df)
         else:
             print("Skipping backtest due to missing actual outcomes.")
         schedule_retraining()

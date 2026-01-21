@@ -2108,16 +2108,16 @@ def fetch_historical_props_from_db(cutoff_date: date | None = None) -> pd.DataFr
     if not table_name:
         logging.info("No historical props table found; skipping prop backtest.")
         return pd.DataFrame()
-    columns_df = pd.read_sql_query(
-        """
-        SELECT column_name
-        FROM information_schema.columns
-        WHERE table_schema = 'public' AND table_name = %s
-        """,
-        conn,
-        params=(table_name,)
-    )
-    columns = set(columns_df["column_name"].tolist())
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cursor:
+        cursor.execute(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = %s
+            """,
+            (table_name,)
+        )
+        columns = {row["column_name"] for row in cursor.fetchall()}
 
     def pick_column(candidates):
         for candidate in candidates:
@@ -4023,7 +4023,7 @@ def main():
     props_inserted = store_player_props_history(props_odds, TARGET_DATE)
     if props_inserted:
         print(f"Stored {props_inserted} player props rows for {TARGET_DATE}.")
-    readiness["props_rows_ingested"] += props_inserted
+    readiness["props_rows_ingested"] += int(props_inserted or 0)
     thresholds = {"player_points": 3.5, "player_assists": 2.5, "player_rebounds": 2.5, "player_threes": 2.5}
     player_team_map = {}
     for _, row in player_stats_ready_df.iterrows():
@@ -4069,20 +4069,23 @@ def main():
         include_under=False,
         predicted_stats_by_player=predicted_stats_by_player
     )
-    print_alt_hit_rate_bets(alt_hit_rate_bets, window=10)
-    if alt_hit_rate_bets_by_game:
-        send_discord_alt_hit_rate_bets(alt_hit_rate_bets_by_game, window=10)
-    else:
-        send_discord_message(
-            f"{PLAYBOOK_MENTION} No 100% alt-line hits found over the last 10 games ending "
-            f"{alt_cutoff}."
-        )
     readiness_ok = (
         readiness["has_actual_outcomes"]
         and readiness["game_backtest_ran"]
         and readiness["prop_backtest_ran"]
         and readiness["historical_prop_rows"] > 0
     )
+    print_alt_hit_rate_bets(alt_hit_rate_bets, window=10)
+    if readiness_ok:
+        if alt_hit_rate_bets_by_game:
+            send_discord_alt_hit_rate_bets(alt_hit_rate_bets_by_game, window=10)
+        else:
+            send_discord_message(
+                f"{PLAYBOOK_MENTION} No 100% alt-line hits found over the last 10 games ending "
+                f"{alt_cutoff}."
+            )
+    else:
+        print("Skipping Discord output because readiness checks are incomplete.")
     if readiness_ok:
         print_game_and_player_predictions(merged_features_today, player_stats_ready_df, player_model, feat_cols,
                                           target_cols, nba_odds, props_odds, thresholds, team_stats_df)

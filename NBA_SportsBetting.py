@@ -75,6 +75,7 @@ PLAYBOOK_USER_ID = "1408438245594763375"
 PLAYBOOK_MENTION = f"<@!{PLAYBOOK_USER_ID}>"
 DISCORD_BOT_TOKEN = "MTM4MDYyMzgxMzQyNzA3MzA5NQ.GAoVyL.3_TfETbDKOlqUGEYhLOE3GI6nYljZxflTENE2w"
 DISCORD_CHANNEL_ID = "1461420980260831253"
+ODDS_INGEST_LOOKBACK_DAYS = 120
 
 session = None
 api_cache_initialized = False
@@ -1910,6 +1911,38 @@ def fetch_mysportsfeeds_game_odds_from_db(start_date, end_date):
         ORDER BY game_date ASC
     """
     return pd.read_sql_query(query, conn, params=(start_date, end_date))
+
+
+def fetch_mysportsfeeds_odds_dates_from_db(start_date, end_date):
+    init_mysportsfeeds_odds_table()
+    conn = get_db_connection()
+    query = """
+        SELECT DISTINCT game_date
+        FROM mysportsfeeds_game_odds
+        WHERE game_date BETWEEN %s AND %s
+    """
+    dates_df = pd.read_sql_query(query, conn, params=(start_date, end_date))
+    return {pd.to_datetime(dt).date() for dt in dates_df["game_date"]}
+
+
+def ingest_mysportsfeeds_odds_history(season, start_date, end_date, max_days=None):
+    if start_date is None or end_date is None:
+        return 0
+    start_date = pd.to_datetime(start_date).date()
+    end_date = pd.to_datetime(end_date).date()
+    if max_days is not None:
+        earliest_allowed = end_date - timedelta(days=max_days)
+        if start_date < earliest_allowed:
+            start_date = earliest_allowed
+    existing_dates = fetch_mysportsfeeds_odds_dates_from_db(start_date, end_date)
+    inserted_total = 0
+    current = start_date
+    while current <= end_date:
+        if current not in existing_dates:
+            rows = fetch_mysportsfeeds_game_odds(season, current)
+            inserted_total += store_mysportsfeeds_game_odds(rows)
+        current += timedelta(days=1)
+    return inserted_total
 
 
 def normalize_prop_market(market: str | None) -> str | None:
@@ -3789,6 +3822,13 @@ def main():
         merged_features_hist["actual_point_diff"] = (
             merged_features_hist["scoring_homeScoreTotal"] - merged_features_hist["scoring_awayScoreTotal"]
         )
+    readiness = {
+        "has_actual_outcomes": has_actuals,
+        "game_backtest_ran": False,
+        "prop_backtest_ran": False,
+        "historical_prop_rows": 0,
+        "odds_rows_ingested": 0
+    }
     game_model, game_features = train_game_prediction_model_with_optuna_cv(merged_features_hist, n_trials=10)
     if game_model is not None:
         nba_odds = get_nba_odds()  # fetch actual game odds
@@ -3796,6 +3836,18 @@ def main():
         inserted = store_mysportsfeeds_game_odds(odds_rows)
         if inserted:
             print(f"Stored {inserted} MySportsFeeds game odds rows for {TARGET_DATE}.")
+        readiness["odds_rows_ingested"] += inserted
+        hist_start = merged_features_hist["local_date"].min()
+        hist_end = merged_features_hist["local_date"].max()
+        hist_inserted = ingest_mysportsfeeds_odds_history(
+            seasons[-1],
+            hist_start,
+            hist_end,
+            max_days=ODDS_INGEST_LOOKBACK_DAYS
+        )
+        if hist_inserted:
+            print(f"Stored {hist_inserted} MySportsFeeds game odds rows for history window.")
+        readiness["odds_rows_ingested"] += hist_inserted
         X_today = merged_features_today[game_features].fillna(0)
         if X_today.shape[0] == 0:
             print("No games found for today's slate after feature prep; skipping game predictions.")
@@ -3827,6 +3879,7 @@ def main():
             backtest_betting_strategy(merged_features_hist, game_model, game_features,
                                       {"player_points": 3.5, "player_assists": 2.5, "player_rebounds": 2.5,
                                        "player_threes": 2.5}, nba_odds, msf_odds_df=msf_odds_df)
+            readiness["game_backtest_ran"] = True
         else:
             print("Skipping backtest due to missing actual outcomes.")
         schedule_retraining()
@@ -3922,6 +3975,8 @@ def main():
     if not historical_props_df.empty:
         merged_props_df = build_prop_backtest_dataset(gamelog_source, historical_props_df)
         evaluate_prop_backtest(merged_props_df)
+        readiness["prop_backtest_ran"] = not merged_props_df.empty
+        readiness["historical_prop_rows"] = len(historical_props_df)
     else:
         print("No historical props available for out-of-sample prop evaluation.")
     alt_hit_rate_bets, alt_hit_rate_bets_by_game = compute_alt_lines_from_recent_games(
@@ -3946,6 +4001,9 @@ def main():
                                       target_cols, nba_odds, props_odds, thresholds, team_stats_df)
     build_html_predictions(merged_features_today, player_stats_ready_df, player_model, feat_cols, target_cols,
                            nba_odds, props_odds, thresholds, team_stats_df)
+    print("\n=== Readiness Report ===")
+    for key, value in readiness.items():
+        print(f"{key}: {value}")
     print("Main routine processing complete.")
 
 

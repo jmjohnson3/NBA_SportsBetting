@@ -2155,7 +2155,10 @@ def fetch_historical_props_from_db(cutoff_date: date | None = None) -> pd.DataFr
     if cutoff_date is not None:
         query += sql.SQL(" WHERE {}::date <= %s").format(sql.Identifier(selected["game_date"]))
         params.append(cutoff_date)
-    props_df = pd.read_sql_query(query, conn, params=params)
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cursor:
+        cursor.execute(query.as_string(conn), params)
+        rows = cursor.fetchall()
+    props_df = pd.DataFrame(rows)
     print(f"Loaded {len(props_df)} rows from historical props table {table_name}.")
     return props_df
 

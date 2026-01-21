@@ -1346,8 +1346,7 @@ def compute_alt_lines_from_recent_games(player_gamelogs_df, games_today_df=None,
                                         cutoff_date: date | None = None, teams_filter=None,
                                         player_team_map=None, include_under: bool = False,
                                         min_alt_line: float = 0.5,
-                                        min_alt_lines_by_market: dict | None = None,
-                                        min_avg_by_market: dict | None = None):
+                                        min_alt_lines_by_market: dict | None = None):
     if player_gamelogs_df.empty:
         logging.info("No player gamelogs available for alternative line evaluation.")
         return [], {}
@@ -1465,13 +1464,6 @@ def compute_alt_lines_from_recent_games(player_gamelogs_df, games_today_df=None,
             "player_assists": 2.0,
             "player_rebounds": 3.0
         }
-    if min_avg_by_market is None:
-        min_avg_by_market = {
-            "player_points": 8.0,
-            "player_assists": 3.0,
-            "player_rebounds": 4.0
-        }
-
     for _, group in df.groupby(group_key):
         group = group.dropna(subset=["game_date"])
         if group.empty:
@@ -1505,9 +1497,6 @@ def compute_alt_lines_from_recent_games(player_gamelogs_df, games_today_df=None,
         for market, stat_col in market_cols.items():
             stat_values = pd.to_numeric(last_games[stat_col], errors="coerce")
             if stat_values.isna().any():
-                continue
-            avg_value = stat_values.mean()
-            if avg_value < min_avg_by_market.get(market, 0.0):
                 continue
             min_value = stat_values.min()
             max_value = stat_values.max()

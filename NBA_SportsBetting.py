@@ -1799,6 +1799,251 @@ def fetch_player_gamelogs_from_db(cutoff_date: date | None = None) -> pd.DataFra
     return db_df
 
 
+def normalize_prop_market(market: str | None) -> str | None:
+    if not market:
+        return None
+    cleaned = market.strip().lower().replace(" ", "_")
+    mapping = {
+        "points": "player_points",
+        "pts": "player_points",
+        "player_points": "player_points",
+        "assists": "player_assists",
+        "ast": "player_assists",
+        "player_assists": "player_assists",
+        "rebounds": "player_rebounds",
+        "reb": "player_rebounds",
+        "player_rebounds": "player_rebounds",
+        "threes": "player_threes",
+        "3s": "player_threes",
+        "3pt": "player_threes",
+        "player_threes": "player_threes",
+    }
+    return mapping.get(cleaned, cleaned)
+
+
+def compute_implied_prob_from_american(price):
+    try:
+        price = float(price)
+    except (TypeError, ValueError):
+        return None
+    if price == 0:
+        return None
+    if price < 0:
+        return (-price) / ((-price) + 100)
+    return 100 / (price + 100)
+
+
+def compute_fair_prob_over(over_price, under_price):
+    over_prob = compute_implied_prob_from_american(over_price)
+    under_prob = compute_implied_prob_from_american(under_price)
+    if over_prob is None or under_prob is None:
+        return None
+    total = over_prob + under_prob
+    if total == 0:
+        return None
+    return over_prob / total
+
+
+def fetch_historical_props_from_db(cutoff_date: date | None = None) -> pd.DataFrame:
+    table_candidates = [
+        "player_props_history",
+        "player_props",
+        "props_history",
+        "player_prop_lines",
+        "props_lines"
+    ]
+    conn = get_db_connection()
+    with conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT table_name
+                FROM information_schema.tables
+                WHERE table_schema = 'public'
+                """
+            )
+            available_tables = {row[0] for row in cursor.fetchall()}
+    table_name = next((t for t in table_candidates if t in available_tables), None)
+    if not table_name:
+        logging.info("No historical props table found; skipping prop backtest.")
+        return pd.DataFrame()
+    columns_df = pd.read_sql_query(
+        """
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_schema = 'public' AND table_name = %s
+        """,
+        conn,
+        params=(table_name,)
+    )
+    columns = set(columns_df["column_name"].tolist())
+
+    def pick_column(candidates):
+        for candidate in candidates:
+            if candidate in columns:
+                return candidate
+        return None
+
+    selected = {
+        "player_name": pick_column(["player_name", "player", "name", "playerName"]),
+        "market": pick_column(["market", "prop_type", "stat_type", "prop"]),
+        "line": pick_column(["line", "prop_line", "point", "points", "total"]),
+        "game_date": pick_column(["game_date", "date", "gameDate", "start_time", "game_start_time", "startTime"]),
+        "over_price": pick_column(["over_price", "overOdds", "over_odds", "price_over", "over_price_american"]),
+        "under_price": pick_column(["under_price", "underOdds", "under_odds", "price_under", "under_price_american"])
+    }
+    if not selected["player_name"] or not selected["market"] or not selected["line"] or not selected["game_date"]:
+        logging.info("Historical props table '%s' missing required columns; skipping prop backtest.", table_name)
+        return pd.DataFrame()
+
+    select_cols = [
+        sql.SQL("{} AS player_name").format(sql.Identifier(selected["player_name"])),
+        sql.SQL("{} AS market").format(sql.Identifier(selected["market"])),
+        sql.SQL("{} AS line").format(sql.Identifier(selected["line"])),
+        sql.SQL("{} AS game_date").format(sql.Identifier(selected["game_date"]))
+    ]
+    if selected["over_price"]:
+        select_cols.append(sql.SQL("{} AS over_price").format(sql.Identifier(selected["over_price"])))
+    if selected["under_price"]:
+        select_cols.append(sql.SQL("{} AS under_price").format(sql.Identifier(selected["under_price"])))
+    query = sql.SQL("SELECT {fields} FROM {table}").format(
+        fields=sql.SQL(", ").join(select_cols),
+        table=sql.Identifier(table_name)
+    )
+    params = []
+    if cutoff_date is not None:
+        query += sql.SQL(" WHERE {col}::date <= %s").format(sql.Identifier(selected["game_date"]))
+        params.append(cutoff_date)
+    props_df = pd.read_sql_query(query, conn, params=params)
+    print(f"Loaded {len(props_df)} rows from historical props table {table_name}.")
+    return props_df
+
+
+def build_prop_backtest_dataset(player_gamelogs_df, props_history_df):
+    if player_gamelogs_df.empty or props_history_df.empty:
+        return pd.DataFrame()
+    gamelogs = player_gamelogs_df.copy()
+    if "stats" in gamelogs.columns and gamelogs["stats"].apply(lambda x: isinstance(x, dict)).all():
+        stats_flat = pd.json_normalize(gamelogs["stats"])
+        stats_flat.columns = [f"stats_{col}" for col in stats_flat.columns]
+        gamelogs = pd.concat([gamelogs.drop(columns=["stats"]), stats_flat], axis=1)
+
+    def select_col(*possible_keys):
+        for key in possible_keys:
+            if key in gamelogs.columns:
+                return key
+        return None
+
+    cols = {
+        "player_points": select_col("stats_offense.pts", "stats_offense.ptsPerGame", "pts"),
+        "player_assists": select_col("stats_offense.ast", "stats_offense.astPerGame", "ast"),
+        "player_rebounds": select_col("stats_rebounds.reb", "stats_rebounds.rebPerGame", "reb"),
+        "player_threes": select_col("stats_fieldGoals.fg3PtMade", "stats_fieldGoals.fg3PtMadePerGame", "fg3")
+    }
+    if any(col is None for col in cols.values()):
+        logging.info("Missing gamelog stat columns for prop backtest; skipping.")
+        return pd.DataFrame()
+    if "player_name" in gamelogs.columns:
+        gamelogs["player_name"] = gamelogs["player_name"].astype(str)
+    elif "player" in gamelogs.columns:
+        gamelogs["player_name"] = gamelogs["player"].apply(
+            lambda x: f"{x.get('firstName', '')} {x.get('lastName', '')}".strip() if isinstance(x, dict) else str(x)
+        )
+    else:
+        logging.info("Missing player name column in gamelogs; skipping prop backtest.")
+        return pd.DataFrame()
+    if "game_date" in gamelogs.columns:
+        gamelogs["game_date"] = pd.to_datetime(gamelogs["game_date"], errors="coerce")
+    elif "game.startTime" in gamelogs.columns:
+        gamelogs["game_date"] = pd.to_datetime(gamelogs["game.startTime"], errors="coerce")
+    else:
+        logging.info("Missing game date column in gamelogs; skipping prop backtest.")
+        return pd.DataFrame()
+
+    long_rows = []
+    for market, stat_col in cols.items():
+        subset = gamelogs[["player_name", "game_date", stat_col]].copy()
+        subset["market"] = market
+        subset["actual_value"] = pd.to_numeric(subset[stat_col], errors="coerce")
+        subset = subset.drop(columns=[stat_col])
+        long_rows.append(subset)
+    gamelog_long = pd.concat(long_rows, ignore_index=True)
+    gamelog_long["player_name_norm"] = gamelog_long["player_name"].apply(normalize_player_name)
+    gamelog_long = gamelog_long.dropna(subset=["player_name_norm", "game_date", "actual_value"])
+    gamelog_long = gamelog_long.sort_values("game_date")
+
+    props = props_history_df.copy()
+    props["player_name_norm"] = props["player_name"].apply(normalize_player_name)
+    props["market_norm"] = props["market"].apply(normalize_prop_market)
+    props["line"] = pd.to_numeric(props["line"], errors="coerce")
+    props["game_date"] = pd.to_datetime(props["game_date"], errors="coerce")
+    props = props.dropna(subset=["player_name_norm", "market_norm", "line", "game_date"])
+
+    merged = gamelog_long.merge(
+        props,
+        left_on=["player_name_norm", "market", "game_date"],
+        right_on=["player_name_norm", "market_norm", "game_date"],
+        how="inner",
+        suffixes=("", "_prop")
+    )
+    if merged.empty:
+        return merged
+    merged["fair_prob_over"] = merged.apply(
+        lambda row: compute_fair_prob_over(row.get("over_price"), row.get("under_price")),
+        axis=1
+    )
+    merged = merged.sort_values("game_date")
+    grouped = merged.groupby(["player_name_norm", "market"], group_keys=False)
+    merged["rolling_mean"] = grouped["actual_value"].apply(
+        lambda s: s.rolling(window=10, min_periods=5).mean().shift(1)
+    )
+    merged["rolling_std"] = grouped["actual_value"].apply(
+        lambda s: s.rolling(window=10, min_periods=5).std().shift(1)
+    )
+    merged["model_prob_over"] = merged.apply(
+        lambda row: 0.5 if pd.isna(row["rolling_std"]) or row["rolling_std"] == 0
+        else norm.cdf((row["rolling_mean"] - row["line"]) / row["rolling_std"]),
+        axis=1
+    )
+    merged["actual_over"] = (merged["actual_value"] > merged["line"]).astype(int)
+    return merged
+
+
+def evaluate_prop_backtest(merged_props_df):
+    if merged_props_df.empty:
+        logging.info("No merged prop data available for backtesting.")
+        return None
+    merged_props_df = merged_props_df.sort_values("game_date")
+    train_df, eval_df = time_ordered_split(merged_props_df, test_size=0.2, date_col="game_date")
+    if train_df.empty or eval_df.empty:
+        logging.info("Insufficient prop data for out-of-sample backtest.")
+        return None
+    calibrated_probs, calibrator = calibrate_win_probabilities(
+        train_df["model_prob_over"].values,
+        train_df["actual_over"].values
+    )
+    eval_df = eval_df.copy()
+    eval_df["calibrated_prob_over"] = calibrator.predict(eval_df["model_prob_over"].values)
+    eval_df["edge_over"] = eval_df["calibrated_prob_over"] - eval_df["fair_prob_over"]
+    eval_df["edge_over"] = eval_df["edge_over"].fillna(0)
+    bins = np.linspace(0, 1, 11)
+    eval_df["prob_bin"] = pd.cut(eval_df["calibrated_prob_over"], bins=bins, include_lowest=True)
+    reliability = eval_df.groupby("prob_bin").agg(
+        avg_pred=("calibrated_prob_over", "mean"),
+        avg_actual=("actual_over", "mean"),
+        count=("actual_over", "size")
+    ).reset_index()
+    print("Prop backtest reliability (calibrated over probabilities):")
+    print(reliability)
+    avg_edge = eval_df["edge_over"].mean()
+    print(f"Average calibrated edge vs fair price (over): {avg_edge:.4f}")
+    return {
+        "reliability": reliability,
+        "avg_edge": avg_edge,
+        "eval_rows": len(eval_df)
+    }
+
+
 def compute_perfect_hit_rate_bets(player_gamelogs_df, props_odds, games_today_df, window: int = 5,
                                   player_team_map=None):
     if player_gamelogs_df.empty:
@@ -3497,6 +3742,12 @@ def main():
         print(f"Alt-line scan using DB gamelogs with {len(db_player_gamelogs)} rows.")
     else:
         print(f"Alt-line scan using API gamelogs with {len(seasonal_player_gamelogs)} rows.")
+    historical_props_df = fetch_historical_props_from_db(alt_cutoff)
+    if not historical_props_df.empty:
+        merged_props_df = build_prop_backtest_dataset(gamelog_source, historical_props_df)
+        evaluate_prop_backtest(merged_props_df)
+    else:
+        print("No historical props available for out-of-sample prop evaluation.")
     alt_hit_rate_bets, alt_hit_rate_bets_by_game = compute_alt_lines_from_recent_games(
         gamelog_source,
         games_today_df,

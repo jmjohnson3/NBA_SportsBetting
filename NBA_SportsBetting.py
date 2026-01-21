@@ -2153,7 +2153,7 @@ def fetch_historical_props_from_db(cutoff_date: date | None = None) -> pd.DataFr
     )
     params = []
     if cutoff_date is not None:
-        query += sql.SQL(" WHERE {col}::date <= %s").format(sql.Identifier(selected["game_date"]))
+        query += sql.SQL(" WHERE {}::date <= %s").format(sql.Identifier(selected["game_date"]))
         params.append(cutoff_date)
     props_df = pd.read_sql_query(query, conn, params=params)
     print(f"Loaded {len(props_df)} rows from historical props table {table_name}.")

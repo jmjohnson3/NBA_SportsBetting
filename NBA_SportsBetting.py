@@ -2184,7 +2184,7 @@ def get_team_stat(ts_df, team_identifier, stat_col):
 # =============================================================================
 # NEW: Game-Level Model Training with Optuna, Time-Series CV, and Stacking Ensemble
 # =============================================================================
-def train_game_prediction_model_with_optuna_cv(merged_features, n_trials=1000):
+def train_game_prediction_model_with_optuna_cv(merged_features, n_trials=10):
     # Keep the list of features as before.
     features = [
         "home_team_pts", "away_team_pts",
@@ -2575,7 +2575,7 @@ def feature_engineering(games_df, boxscore_df, playbyplay_df, team_stats_df, his
     return df
 
 
-def train_game_prediction_model_with_optuna(merged_features, n_trials=1000):
+def train_game_prediction_model_with_optuna(merged_features, n_trials=10):
     features = [
         "home_team_pts", "away_team_pts",
         "home_team_pts_allowed", "away_team_pts_allowed",
@@ -2960,7 +2960,7 @@ def train_individual_models(X, y, trial):
 
 
 def train_player_stats_model_with_optuna(player_stats_df, daily_player_gamelogs_df, injuries_df, team_stats_df,
-                                         games_df, n_trials=10000, n_jobs=4):
+                                         games_df, n_trials=10, n_jobs=4):
     df = player_stats_df.copy()
     if "stats" in df.columns:
         stats_flat = pd.json_normalize(df["stats"]).add_prefix("stats_")

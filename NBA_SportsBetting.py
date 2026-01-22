@@ -4073,12 +4073,13 @@ def main():
         print(f"Alt-line scan using DB gamelogs with {len(db_player_gamelogs)} rows.")
     else:
         print(f"Alt-line scan using API gamelogs with {len(seasonal_player_gamelogs)} rows.")
+    total_props_df = fetch_historical_props_from_db()
+    readiness["historical_prop_rows"] = len(total_props_df)
     historical_props_df = fetch_historical_props_from_db(alt_cutoff)
     if not historical_props_df.empty:
         merged_props_df = build_prop_backtest_dataset(gamelog_source, historical_props_df)
         evaluate_prop_backtest(merged_props_df)
         readiness["prop_backtest_ran"] = not merged_props_df.empty
-        readiness["historical_prop_rows"] = len(historical_props_df)
     else:
         print("No historical props available for out-of-sample prop evaluation.")
     alt_hit_rate_bets, alt_hit_rate_bets_by_game = compute_alt_lines_from_recent_games(

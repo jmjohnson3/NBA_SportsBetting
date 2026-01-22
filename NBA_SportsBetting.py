@@ -1997,11 +1997,33 @@ def normalize_prop_market(market: str | None) -> str | None:
 def parse_props_key(key: str):
     if not key:
         return None, None
-    known_market_suffixes = ("player_points", "player_assists", "player_rebounds", "player_threes")
-    for suffix in known_market_suffixes:
-        if key.endswith(f"_{suffix}"):
-            name_part = key[:-(len(suffix) + 1)]
-            return name_part, suffix
+    cleaned_key = " ".join(key.strip().lower().replace("_", " ").split())
+    if not cleaned_key:
+        return None, None
+    market_aliases = (
+        "player points",
+        "player assists",
+        "player rebounds",
+        "player threes",
+        "points",
+        "pts",
+        "assists",
+        "ast",
+        "rebounds",
+        "reb",
+        "threes",
+        "3s",
+        "3pt",
+    )
+    for alias in sorted(market_aliases, key=len, reverse=True):
+        if cleaned_key.endswith(alias):
+            name_part = cleaned_key[: -len(alias)].strip()
+            if not name_part:
+                return None, None
+            market = normalize_prop_market(alias)
+            if not market:
+                return None, None
+            return name_part, market
     return None, None
 
 

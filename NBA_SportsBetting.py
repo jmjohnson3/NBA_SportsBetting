@@ -657,6 +657,11 @@ def train_rl_agent_on_betting(env, total_timesteps=10000):
 # (The functions below remain unchanged from your original code.)
 # -------------------------------
 def extract_in_game_features(playbyplay_df, game_id):
+    if playbyplay_df is None or playbyplay_df.empty:
+        return None
+    if "game_id" not in playbyplay_df.columns:
+        logging.warning("game_id column not found in play-by-play data; skipping in-game features.")
+        return None
     game_plays = playbyplay_df[playbyplay_df["game_id"] == game_id]
     if game_plays.empty:
         return None
@@ -676,7 +681,7 @@ def extract_in_game_features(playbyplay_df, game_id):
 
 def blend_predictions(pre_game_pred_diff, in_game_features, total_game_seconds=2880):
     seconds_remaining = in_game_features["seconds_remaining"]
-    current_diff = in_game_features.get("scoreDifferential", 0)
+    current_diff = in_game_features.get("current_score_diff", in_game_features.get("scoreDifferential", 0))
     elapsed_fraction = 1 - (seconds_remaining / total_game_seconds)
     blended_diff = (1 - elapsed_fraction) * pre_game_pred_diff + elapsed_fraction * current_diff
     return blended_diff

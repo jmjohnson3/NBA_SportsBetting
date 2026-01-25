@@ -17,8 +17,7 @@ import requests
 import pandas as pd
 from dateutil import parser
 from requests.auth import HTTPBasicAuth
-from sklearn.decomposition import PCA
-from sklearn.model_selection import train_test_split, TimeSeriesSplit
+from sklearn.model_selection import TimeSeriesSplit
 from sklearn.metrics import mean_squared_error, r2_score
 from xgboost import XGBRegressor
 import numpy as np
@@ -29,10 +28,10 @@ from jinja2 import Template
 import aiohttp
 from scipy.stats import norm
 from sklearn.cluster import KMeans
+from sklearn.base import clone
 
 # For scaling pipeline and ensemble (if desired)
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler, RobustScaler
+from sklearn.preprocessing import RobustScaler
 
 # Set pandas option to opt in to future downcasting behavior
 pd.set_option('future.no_silent_downcasting', True)
@@ -76,6 +75,8 @@ PLAYBOOK_USER_ID = "1408438245594763375"
 PLAYBOOK_MENTION = f"<@!{PLAYBOOK_USER_ID}>"
 DISCORD_BOT_TOKEN = "MTM4MDYyMzgxMzQyNzA3MzA5NQ.GAoVyL.3_TfETbDKOlqUGEYhLOE3GI6nYljZxflTENE2w"
 DISCORD_CHANNEL_ID = "1461420980260831253"
+ODDS_INGEST_LOOKBACK_DAYS = 120
+PROPS_INGEST_LOOKBACK_DAYS = 30
 
 session = None
 api_cache_initialized = False
@@ -305,23 +306,55 @@ def schedule_retraining():
     print("Retraining check complete. (Implement scheduling externally.)")
 
 
-def backtest_betting_strategy(historical_df, model, game_features, betting_thresholds):
+def backtest_betting_strategy(historical_df, model, game_features, betting_thresholds, nba_odds,
+                              msf_odds_df=None, default_odds=2.0, date_col="local_date"):
     """
-    Backtest the betting strategy on historical data.
+    Backtest the betting strategy on historical data with an out-of-sample split.
     """
+    if historical_df.empty:
+        print("\n=== Backtesting Betting Strategy ===")
+        print("No historical data available for backtesting.")
+        return
+    df = historical_df.copy()
+    if date_col in df.columns:
+        df = df.sort_values(date_col)
+    split_idx = int(len(df) * 0.8)
+    train_df = df.iloc[:split_idx].copy()
+    eval_df = df.iloc[split_idx:].copy()
+    if train_df.empty or eval_df.empty:
+        print("\n=== Backtesting Betting Strategy ===")
+        print("Insufficient data for out-of-sample backtesting.")
+        return
+    X_train = train_df[game_features].fillna(0)
+    fitted_model = clone(model)
+    fitted_model.fit(X_train, train_df["actual_point_diff"])
+    train_preds = fitted_model.predict(X_train)
+    train_actuals = (train_df["actual_point_diff"] > 0).astype(int).values
+    train_probs = compute_win_probability(train_preds)
+    _, calibrator = calibrate_win_probabilities(train_probs, train_actuals)
+    eval_odds = assign_game_odds(eval_df, nba_odds, default_odds=default_odds)
+    if msf_odds_df is not None and not msf_odds_df.empty:
+        eval_odds, fair_probs = assign_game_odds_with_hold(eval_df, msf_odds_df, default_odds=default_odds)
+    else:
+        fair_probs = np.array([None] * len(eval_df))
     total_return = 0
     bets = 0
-    for idx, row in historical_df.iterrows():
+    for idx, row in eval_df.iterrows():
         X = pd.DataFrame([row[game_features].fillna(0)])
-        pred_diff = model.predict(X)[0]
-        win_prob = 1.0 / (1.0 + np.exp(-pred_diff / 10.0))
-        sportsbook_odds = 2.0  # example odds
-        kelly = compute_betting_edge(win_prob, sportsbook_odds)
+        pred_diff = fitted_model.predict(X)[0]
+        raw_prob = compute_win_probability(pred_diff)
+        win_prob = calibrator.predict([raw_prob])[0]
+        sportsbook_odds = eval_odds[eval_df.index.get_loc(idx)]
+        fair_prob = fair_probs[eval_df.index.get_loc(idx)]
+        if fair_prob is not None and win_prob <= fair_prob:
+            kelly = 0.0
+        else:
+            kelly = compute_betting_edge(win_prob, sportsbook_odds)
         bet_result = sportsbook_odds - 1 if row.get("actual_point_diff", 0) > 0 else -1
         total_return += kelly * bet_result
         bets += 1
     print("\n=== Backtesting Betting Strategy ===")
-    print(f"Total simulated return over {bets} bets: {total_return:.2f}")
+    print(f"Total simulated return over {bets} out-of-sample bets: {total_return:.2f}")
 
 
 # -------------------------------
@@ -624,6 +657,11 @@ def train_rl_agent_on_betting(env, total_timesteps=10000):
 # (The functions below remain unchanged from your original code.)
 # -------------------------------
 def extract_in_game_features(playbyplay_df, game_id):
+    if playbyplay_df is None or playbyplay_df.empty:
+        return None
+    if "game_id" not in playbyplay_df.columns:
+        logging.warning("game_id column not found in play-by-play data; skipping in-game features.")
+        return None
     game_plays = playbyplay_df[playbyplay_df["game_id"] == game_id]
     if game_plays.empty:
         return None
@@ -643,7 +681,7 @@ def extract_in_game_features(playbyplay_df, game_id):
 
 def blend_predictions(pre_game_pred_diff, in_game_features, total_game_seconds=2880):
     seconds_remaining = in_game_features["seconds_remaining"]
-    current_diff = in_game_features.get("scoreDifferential", 0)
+    current_diff = in_game_features.get("current_score_diff", in_game_features.get("scoreDifferential", 0))
     elapsed_fraction = 1 - (seconds_remaining / total_game_seconds)
     blended_diff = (1 - elapsed_fraction) * pre_game_pred_diff + elapsed_fraction * current_diff
     return blended_diff
@@ -851,6 +889,67 @@ def add_travel_distance_feature(games_df, team_locations, historical_games):
     games_df["home_travel_distance"] = 0.0
     games_df["away_travel_distance"] = 0.0
     return games_df
+
+
+def compute_team_rolling_scores(historical_games, window=10):
+    if historical_games is None or historical_games.empty:
+        return pd.DataFrame()
+    required_cols = {"local_date", "homeTeam", "awayTeam"}
+    if not required_cols.issubset(set(historical_games.columns)):
+        return pd.DataFrame()
+    score_cols = None
+    if {"homeTeamPts", "awayTeamPts"}.issubset(set(historical_games.columns)):
+        score_cols = ("homeTeamPts", "awayTeamPts")
+    elif {"scoring_homeScoreTotal", "scoring_awayScoreTotal"}.issubset(set(historical_games.columns)):
+        score_cols = ("scoring_homeScoreTotal", "scoring_awayScoreTotal")
+    if score_cols is None:
+        return pd.DataFrame()
+
+    def extract_abbr(team):
+        if isinstance(team, dict):
+            return team.get("abbreviation")
+        return team
+
+    home_pts_col, away_pts_col = score_cols
+    long_rows = []
+    for _, row in historical_games.iterrows():
+        local_date = row.get("local_date")
+        if pd.isna(local_date):
+            continue
+        home_abbr = extract_abbr(row.get("homeTeam"))
+        away_abbr = extract_abbr(row.get("awayTeam"))
+        if not home_abbr or not away_abbr:
+            continue
+        home_pts = row.get(home_pts_col)
+        away_pts = row.get(away_pts_col)
+        if pd.isna(home_pts) or pd.isna(away_pts):
+            continue
+        long_rows.append(
+            {"team_abbr": str(home_abbr).upper().strip(), "local_date": local_date,
+             "points_for": home_pts, "points_against": away_pts}
+        )
+        long_rows.append(
+            {"team_abbr": str(away_abbr).upper().strip(), "local_date": local_date,
+             "points_for": away_pts, "points_against": home_pts}
+        )
+    if not long_rows:
+        return pd.DataFrame()
+    long_df = pd.DataFrame(long_rows).sort_values("local_date")
+    grouped = long_df.groupby("team_abbr", group_keys=False)
+    long_df["rolling_points_for"] = grouped["points_for"].apply(
+        lambda s: s.rolling(window=window, min_periods=1).mean().shift(1)
+    )
+    long_df["rolling_points_against"] = grouped["points_against"].apply(
+        lambda s: s.rolling(window=window, min_periods=1).mean().shift(1)
+    )
+    return long_df[["team_abbr", "local_date", "rolling_points_for", "rolling_points_against"]]
+
+
+def time_ordered_split(df, test_size=0.2, date_col=None):
+    if date_col and date_col in df.columns:
+        df = df.sort_values(date_col)
+    split_idx = int(len(df) * (1 - test_size))
+    return df.iloc[:split_idx], df.iloc[split_idx:]
 
 
 def enhance_feature_engineering(games_df, team_stats_df, boxscore_df=None, historical_games=None):
@@ -1715,6 +1814,507 @@ def fetch_player_gamelogs_from_db(cutoff_date: date | None = None) -> pd.DataFra
     return db_df
 
 
+def init_mysportsfeeds_odds_table():
+    conn = get_db_connection()
+    with conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS mysportsfeeds_game_odds (
+                    id SERIAL PRIMARY KEY,
+                    game_date DATE NOT NULL,
+                    home_team_abbr TEXT NOT NULL,
+                    away_team_abbr TEXT NOT NULL,
+                    home_moneyline NUMERIC,
+                    away_moneyline NUMERIC,
+                    bookmaker TEXT,
+                    payload JSONB,
+                    fetched_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_msf_game_odds_unique
+                ON mysportsfeeds_game_odds (game_date, home_team_abbr, away_team_abbr, bookmaker)
+                """
+            )
+
+
+def init_player_props_history_table():
+    conn = get_db_connection()
+    with conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS player_props_history (
+                    id SERIAL PRIMARY KEY,
+                    game_date DATE NOT NULL,
+                    player_name TEXT NOT NULL,
+                    market TEXT NOT NULL,
+                    line NUMERIC,
+                    source TEXT,
+                    payload JSONB,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_player_props_history_unique
+                ON player_props_history (game_date, player_name, market, source)
+                """
+            )
+
+
+def fetch_mysportsfeeds_game_odds(season, date_obj):
+    date_str = date_obj.strftime("%Y%m%d")
+    url = (
+        f"https://api.mysportsfeeds.com/v2.1/pull/nba/{season}-regular/date/{date_str}/odds_gamelines.json"
+    )
+    payload = fetch_api_data(url)
+    if not payload or not isinstance(payload, dict):
+        return []
+    game_lines = payload.get("gameLines") or payload.get("gamelines") or []
+    rows = []
+    for entry in game_lines:
+        if not isinstance(entry, dict):
+            continue
+        game = entry.get("game", {})
+        home_team = game.get("homeTeam", {}) if isinstance(game, dict) else {}
+        away_team = game.get("awayTeam", {}) if isinstance(game, dict) else {}
+        home_abbr = home_team.get("abbreviation") or game.get("homeTeamAbbreviation")
+        away_abbr = away_team.get("abbreviation") or game.get("awayTeamAbbreviation")
+        if not home_abbr or not away_abbr:
+            continue
+        home_moneyline = entry.get("homeMoneyline") or entry.get("homeLine")
+        away_moneyline = entry.get("awayMoneyline") or entry.get("awayLine")
+        bookmaker = entry.get("sportsbook") or entry.get("bookmaker")
+        rows.append({
+            "game_date": date_obj,
+            "home_team_abbr": str(home_abbr).upper().strip(),
+            "away_team_abbr": str(away_abbr).upper().strip(),
+            "home_moneyline": home_moneyline,
+            "away_moneyline": away_moneyline,
+            "bookmaker": bookmaker,
+            "payload": entry
+        })
+    return rows
+
+
+def store_mysportsfeeds_game_odds(rows):
+    if not rows:
+        return 0
+    init_mysportsfeeds_odds_table()
+    conn = get_db_connection()
+    inserted = 0
+    with conn:
+        with conn.cursor() as cursor:
+            for row in rows:
+                cursor.execute(
+                    """
+                    INSERT INTO mysportsfeeds_game_odds (
+                        game_date, home_team_abbr, away_team_abbr, home_moneyline, away_moneyline, bookmaker, payload
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (game_date, home_team_abbr, away_team_abbr, bookmaker) DO NOTHING
+                    """,
+                    (
+                        row["game_date"],
+                        row["home_team_abbr"],
+                        row["away_team_abbr"],
+                        row["home_moneyline"],
+                        row["away_moneyline"],
+                        row["bookmaker"],
+                        psycopg2.extras.Json(row["payload"])
+                    )
+                )
+                inserted += cursor.rowcount
+    return inserted
+
+
+def fetch_mysportsfeeds_game_odds_from_db(start_date, end_date):
+    init_mysportsfeeds_odds_table()
+    conn = get_db_connection()
+    query = """
+        SELECT game_date, home_team_abbr, away_team_abbr, home_moneyline, away_moneyline, bookmaker
+        FROM mysportsfeeds_game_odds
+        WHERE game_date BETWEEN %s AND %s
+        ORDER BY game_date ASC
+    """
+    return pd.read_sql_query(query, conn, params=(start_date, end_date))
+
+
+def fetch_mysportsfeeds_odds_dates_from_db(start_date, end_date):
+    init_mysportsfeeds_odds_table()
+    conn = get_db_connection()
+    query = """
+        SELECT DISTINCT game_date
+        FROM mysportsfeeds_game_odds
+        WHERE game_date BETWEEN %s AND %s
+    """
+    dates_df = pd.read_sql_query(query, conn, params=(start_date, end_date))
+    return {pd.to_datetime(dt).date() for dt in dates_df["game_date"]}
+
+
+def ingest_mysportsfeeds_odds_history(season, start_date, end_date, max_days=None):
+    if start_date is None or end_date is None:
+        return 0
+    start_date = pd.to_datetime(start_date).date()
+    end_date = pd.to_datetime(end_date).date()
+    if max_days is not None:
+        earliest_allowed = end_date - timedelta(days=max_days)
+        if start_date < earliest_allowed:
+            start_date = earliest_allowed
+    existing_dates = fetch_mysportsfeeds_odds_dates_from_db(start_date, end_date)
+    inserted_total = 0
+    current = start_date
+    while current <= end_date:
+        if current not in existing_dates:
+            rows = fetch_mysportsfeeds_game_odds(season, current)
+            inserted_total += store_mysportsfeeds_game_odds(rows)
+        current += timedelta(days=1)
+    return inserted_total
+
+
+def normalize_prop_market(market: str | None) -> str | None:
+    if not market:
+        return None
+    cleaned = market.strip().lower().replace(" ", "_")
+    mapping = {
+        "points": "player_points",
+        "pts": "player_points",
+        "player_points": "player_points",
+        "assists": "player_assists",
+        "ast": "player_assists",
+        "player_assists": "player_assists",
+        "rebounds": "player_rebounds",
+        "reb": "player_rebounds",
+        "player_rebounds": "player_rebounds",
+        "threes": "player_threes",
+        "3s": "player_threes",
+        "3pt": "player_threes",
+        "player_threes": "player_threes",
+    }
+    return mapping.get(cleaned, cleaned)
+
+
+def parse_props_key(key: str):
+    if not key:
+        return None, None
+    cleaned_key = " ".join(key.strip().lower().replace("_", " ").split())
+    if not cleaned_key:
+        return None, None
+    market_aliases = (
+        "player points",
+        "player assists",
+        "player rebounds",
+        "player threes",
+        "points",
+        "pts",
+        "assists",
+        "ast",
+        "rebounds",
+        "reb",
+        "threes",
+        "3s",
+        "3pt",
+    )
+    for alias in sorted(market_aliases, key=len, reverse=True):
+        if cleaned_key.endswith(alias):
+            name_part = cleaned_key[: -len(alias)].strip()
+            if not name_part:
+                return None, None
+            market = normalize_prop_market(alias)
+            if not market:
+                return None, None
+            return name_part, market
+    return None, None
+
+
+def store_player_props_history(props_odds, game_date, source="odds_api"):
+    if not props_odds:
+        return 0
+    init_player_props_history_table()
+    conn = get_db_connection()
+    inserted = 0
+    with conn:
+        with conn.cursor() as cursor:
+            for key, line in props_odds.items():
+                name_part, market = parse_props_key(key)
+                if not name_part or not market:
+                    continue
+                player_name = normalize_player_name(name_part)
+                if not player_name:
+                    continue
+                cursor.execute(
+                    """
+                    INSERT INTO player_props_history (game_date, player_name, market, line, source, payload)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (game_date, player_name, market, source) DO NOTHING
+                    """,
+                    (
+                        game_date,
+                        player_name,
+                        market,
+                        line,
+                        source,
+                        psycopg2.extras.Json({"key": key, "line": line})
+                    )
+                )
+                inserted += cursor.rowcount
+    return inserted
+
+
+def compute_implied_prob_from_american(price):
+    try:
+        price = float(price)
+    except (TypeError, ValueError):
+        return None
+    if price == 0:
+        return None
+    if price < 0:
+        return (-price) / ((-price) + 100)
+    return 100 / (price + 100)
+
+
+def compute_fair_prob_over(over_price, under_price):
+    over_prob = compute_implied_prob_from_american(over_price)
+    under_prob = compute_implied_prob_from_american(under_price)
+    if over_prob is None or under_prob is None:
+        return None
+    total = over_prob + under_prob
+    if total == 0:
+        return None
+    return over_prob / total
+
+
+def compute_decimal_odds_from_american(price):
+    try:
+        price = float(price)
+    except (TypeError, ValueError):
+        return None
+    if price == 0:
+        return None
+    if price < 0:
+        return 1 + (100 / abs(price))
+    return 1 + (price / 100)
+
+
+def compute_fair_prob_two_sided(home_price, away_price):
+    home_prob = compute_implied_prob_from_american(home_price)
+    away_prob = compute_implied_prob_from_american(away_price)
+    if home_prob is None or away_prob is None:
+        return None
+    total = home_prob + away_prob
+    if total == 0:
+        return None
+    return home_prob / total
+
+
+def fetch_historical_props_from_db(cutoff_date: date | None = None) -> pd.DataFrame:
+    table_candidates = [
+        "player_props_history",
+        "player_props",
+        "props_history",
+        "player_prop_lines",
+        "props_lines"
+    ]
+    conn = get_db_connection()
+    with conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT table_name
+                FROM information_schema.tables
+                WHERE table_schema = 'public'
+                """
+            )
+            available_tables = {row[0] for row in cursor.fetchall()}
+    table_name = next((t for t in table_candidates if t in available_tables), None)
+    if not table_name:
+        logging.info("No historical props table found; skipping prop backtest.")
+        return pd.DataFrame()
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cursor:
+        cursor.execute(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = %s
+            """,
+            (table_name,)
+        )
+        columns = {row["column_name"] for row in cursor.fetchall()}
+
+    def pick_column(candidates):
+        for candidate in candidates:
+            if candidate in columns:
+                return candidate
+        return None
+
+    selected = {
+        "player_name": pick_column(["player_name", "player", "name", "playerName"]),
+        "market": pick_column(["market", "prop_type", "stat_type", "prop"]),
+        "line": pick_column(["line", "prop_line", "point", "points", "total"]),
+        "game_date": pick_column(["game_date", "date", "gameDate", "start_time", "game_start_time", "startTime"]),
+        "over_price": pick_column(["over_price", "overOdds", "over_odds", "price_over", "over_price_american"]),
+        "under_price": pick_column(["under_price", "underOdds", "under_odds", "price_under", "under_price_american"])
+    }
+    if not selected["player_name"] or not selected["market"] or not selected["line"] or not selected["game_date"]:
+        logging.info("Historical props table '%s' missing required columns; skipping prop backtest.", table_name)
+        return pd.DataFrame()
+
+    select_cols = [
+        sql.SQL("{} AS player_name").format(sql.Identifier(selected["player_name"])),
+        sql.SQL("{} AS market").format(sql.Identifier(selected["market"])),
+        sql.SQL("{} AS line").format(sql.Identifier(selected["line"])),
+        sql.SQL("{} AS game_date").format(sql.Identifier(selected["game_date"]))
+    ]
+    if selected["over_price"]:
+        select_cols.append(sql.SQL("{} AS over_price").format(sql.Identifier(selected["over_price"])))
+    if selected["under_price"]:
+        select_cols.append(sql.SQL("{} AS under_price").format(sql.Identifier(selected["under_price"])))
+    query = sql.SQL("SELECT {fields} FROM {table}").format(
+        fields=sql.SQL(", ").join(select_cols),
+        table=sql.Identifier(table_name)
+    )
+    params = []
+    if cutoff_date is not None:
+        query += sql.SQL(" WHERE {}::date <= %s").format(sql.Identifier(selected["game_date"]))
+        params.append(cutoff_date)
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cursor:
+        cursor.execute(query.as_string(conn), params)
+        rows = cursor.fetchall()
+    props_df = pd.DataFrame(rows)
+    print(f"Loaded {len(props_df)} rows from historical props table {table_name}.")
+    return props_df
+
+
+def build_prop_backtest_dataset(player_gamelogs_df, props_history_df):
+    if player_gamelogs_df.empty or props_history_df.empty:
+        return pd.DataFrame()
+    gamelogs = player_gamelogs_df.copy()
+    if "stats" in gamelogs.columns and gamelogs["stats"].apply(lambda x: isinstance(x, dict)).all():
+        stats_flat = pd.json_normalize(gamelogs["stats"])
+        stats_flat.columns = [f"stats_{col}" for col in stats_flat.columns]
+        gamelogs = pd.concat([gamelogs.drop(columns=["stats"]), stats_flat], axis=1)
+
+    def select_col(*possible_keys):
+        for key in possible_keys:
+            if key in gamelogs.columns:
+                return key
+        return None
+
+    cols = {
+        "player_points": select_col("stats_offense.pts", "stats_offense.ptsPerGame", "pts"),
+        "player_assists": select_col("stats_offense.ast", "stats_offense.astPerGame", "ast"),
+        "player_rebounds": select_col("stats_rebounds.reb", "stats_rebounds.rebPerGame", "reb"),
+        "player_threes": select_col("stats_fieldGoals.fg3PtMade", "stats_fieldGoals.fg3PtMadePerGame", "fg3")
+    }
+    if any(col is None for col in cols.values()):
+        logging.info("Missing gamelog stat columns for prop backtest; skipping.")
+        return pd.DataFrame()
+    if "player_name" in gamelogs.columns:
+        gamelogs["player_name"] = gamelogs["player_name"].astype(str)
+    elif "player" in gamelogs.columns:
+        gamelogs["player_name"] = gamelogs["player"].apply(
+            lambda x: f"{x.get('firstName', '')} {x.get('lastName', '')}".strip() if isinstance(x, dict) else str(x)
+        )
+    else:
+        logging.info("Missing player name column in gamelogs; skipping prop backtest.")
+        return pd.DataFrame()
+    if "game_date" in gamelogs.columns:
+        gamelogs["game_date"] = pd.to_datetime(gamelogs["game_date"], errors="coerce")
+    elif "game.startTime" in gamelogs.columns:
+        gamelogs["game_date"] = pd.to_datetime(gamelogs["game.startTime"], errors="coerce")
+    else:
+        logging.info("Missing game date column in gamelogs; skipping prop backtest.")
+        return pd.DataFrame()
+
+    long_rows = []
+    for market, stat_col in cols.items():
+        subset = gamelogs[["player_name", "game_date", stat_col]].copy()
+        subset["market"] = market
+        subset["actual_value"] = pd.to_numeric(subset[stat_col], errors="coerce")
+        subset = subset.drop(columns=[stat_col])
+        long_rows.append(subset)
+    gamelog_long = pd.concat(long_rows, ignore_index=True)
+    gamelog_long["player_name_norm"] = gamelog_long["player_name"].apply(normalize_player_name)
+    gamelog_long = gamelog_long.dropna(subset=["player_name_norm", "game_date", "actual_value"])
+    gamelog_long = gamelog_long.sort_values("game_date")
+
+    props = props_history_df.copy()
+    props["player_name_norm"] = props["player_name"].apply(normalize_player_name)
+    props["market_norm"] = props["market"].apply(normalize_prop_market)
+    props["line"] = pd.to_numeric(props["line"], errors="coerce")
+    props["game_date"] = pd.to_datetime(props["game_date"], errors="coerce")
+    props = props.dropna(subset=["player_name_norm", "market_norm", "line", "game_date"])
+
+    merged = gamelog_long.merge(
+        props,
+        left_on=["player_name_norm", "market", "game_date"],
+        right_on=["player_name_norm", "market_norm", "game_date"],
+        how="inner",
+        suffixes=("", "_prop")
+    )
+    if merged.empty:
+        return merged
+    merged["fair_prob_over"] = merged.apply(
+        lambda row: compute_fair_prob_over(row.get("over_price"), row.get("under_price")),
+        axis=1
+    )
+    merged = merged.sort_values("game_date")
+    grouped = merged.groupby(["player_name_norm", "market"], group_keys=False)
+    merged["rolling_mean"] = grouped["actual_value"].apply(
+        lambda s: s.rolling(window=10, min_periods=5).mean().shift(1)
+    )
+    merged["rolling_std"] = grouped["actual_value"].apply(
+        lambda s: s.rolling(window=10, min_periods=5).std().shift(1)
+    )
+    merged["model_prob_over"] = merged.apply(
+        lambda row: 0.5 if pd.isna(row["rolling_std"]) or row["rolling_std"] == 0
+        else norm.cdf((row["rolling_mean"] - row["line"]) / row["rolling_std"]),
+        axis=1
+    )
+    merged["actual_over"] = (merged["actual_value"] > merged["line"]).astype(int)
+    return merged
+
+
+def evaluate_prop_backtest(merged_props_df):
+    if merged_props_df.empty:
+        logging.info("No merged prop data available for backtesting.")
+        return None
+    merged_props_df = merged_props_df.sort_values("game_date")
+    train_df, eval_df = time_ordered_split(merged_props_df, test_size=0.2, date_col="game_date")
+    if train_df.empty or eval_df.empty:
+        logging.info("Insufficient prop data for out-of-sample backtest.")
+        return None
+    calibrated_probs, calibrator = calibrate_win_probabilities(
+        train_df["model_prob_over"].values,
+        train_df["actual_over"].values
+    )
+    eval_df = eval_df.copy()
+    eval_df["calibrated_prob_over"] = calibrator.predict(eval_df["model_prob_over"].values)
+    eval_df["edge_over"] = eval_df["calibrated_prob_over"] - eval_df["fair_prob_over"]
+    eval_df["edge_over"] = eval_df["edge_over"].fillna(0)
+    bins = np.linspace(0, 1, 11)
+    eval_df["prob_bin"] = pd.cut(eval_df["calibrated_prob_over"], bins=bins, include_lowest=True)
+    reliability = eval_df.groupby("prob_bin").agg(
+        avg_pred=("calibrated_prob_over", "mean"),
+        avg_actual=("actual_over", "mean"),
+        count=("actual_over", "size")
+    ).reset_index()
+    print("Prop backtest reliability (calibrated over probabilities):")
+    print(reliability)
+    avg_edge = eval_df["edge_over"].mean()
+    print(f"Average calibrated edge vs fair price (over): {avg_edge:.4f}")
+    return {
+        "reliability": reliability,
+        "avg_edge": avg_edge,
+        "eval_rows": len(eval_df)
+    }
+
+
 def compute_perfect_hit_rate_bets(player_gamelogs_df, props_odds, games_today_df, window: int = 5,
                                   player_team_map=None):
     if player_gamelogs_df.empty:
@@ -1726,12 +2326,18 @@ def compute_perfect_hit_rate_bets(player_gamelogs_df, props_odds, games_today_df
     if player_team_map is None:
         player_team_map = {}
     normalized_props = {}
+    known_market_suffixes = ("player_points", "player_assists", "player_rebounds", "player_threes")
     for key, value in props_odds.items():
         if not key:
             continue
-        try:
-            name_part, market = key.rsplit("_", 1)
-        except ValueError:
+        market = None
+        name_part = None
+        for suffix in known_market_suffixes:
+            if key.endswith(f"_{suffix}"):
+                market = suffix
+                name_part = key[:-(len(suffix) + 1)]
+                break
+        if market is None or not name_part:
             continue
         normalized_name = normalize_player_name(name_part)
         if not normalized_name:
@@ -1964,6 +2570,38 @@ def assign_game_odds(merged_features, nba_odds, default_odds=2.0):
     return np.array(odds_array)
 
 
+def assign_game_odds_with_hold(merged_features, msf_odds_df, default_odds=2.0):
+    odds_array = []
+    fair_prob_array = []
+    if msf_odds_df is None or msf_odds_df.empty:
+        return np.array(odds_array), np.array(fair_prob_array)
+    for _, row in merged_features.iterrows():
+        home_team = row.get("home_team_abbr")
+        away_team = row.get("away_team_abbr")
+        game_date = row.get("local_date")
+        if pd.isna(game_date):
+            odds_array.append(default_odds)
+            fair_prob_array.append(None)
+            continue
+        match = msf_odds_df[
+            (msf_odds_df["game_date"] == pd.to_datetime(game_date).date())
+            & (msf_odds_df["home_team_abbr"] == str(home_team).upper().strip())
+            & (msf_odds_df["away_team_abbr"] == str(away_team).upper().strip())
+        ]
+        if match.empty:
+            odds_array.append(default_odds)
+            fair_prob_array.append(None)
+            continue
+        entry = match.iloc[0]
+        home_moneyline = entry.get("home_moneyline")
+        away_moneyline = entry.get("away_moneyline")
+        sportsbook_odds = compute_decimal_odds_from_american(home_moneyline) or default_odds
+        fair_prob = compute_fair_prob_two_sided(home_moneyline, away_moneyline)
+        odds_array.append(sportsbook_odds)
+        fair_prob_array.append(fair_prob)
+    return np.array(odds_array), np.array(fair_prob_array)
+
+
 
 def get_player_props_odds_for_event(event_id):
     url = (
@@ -2103,7 +2741,7 @@ def get_team_stat(ts_df, team_identifier, stat_col):
 # =============================================================================
 # NEW: Game-Level Model Training with Optuna, Time-Series CV, and Stacking Ensemble
 # =============================================================================
-def train_game_prediction_model_with_optuna_cv(merged_features, n_trials=1000):
+def train_game_prediction_model_with_optuna_cv(merged_features, n_trials=10):
     # Keep the list of features as before.
     features = [
         "home_team_pts", "away_team_pts",
@@ -2122,14 +2760,17 @@ def train_game_prediction_model_with_optuna_cv(merged_features, n_trials=1000):
         "predicted_point_diff_adj"
     ]
     features = [f for f in features if f in merged_features.columns]
-    # Set up the target (use actual scores if available)
-    if "scoring_homeScoreTotal" in merged_features.columns and "scoring_awayScoreTotal" in merged_features.columns:
-        merged_features["actual_point_diff"] = merged_features["scoring_homeScoreTotal"] - merged_features[
-            "scoring_awayScoreTotal"]
-    else:
-        merged_features["actual_point_diff"] = merged_features["predicted_point_diff"]
+    # Set up the target (use actual scores only)
+    if "scoring_homeScoreTotal" not in merged_features.columns or "scoring_awayScoreTotal" not in merged_features.columns:
+        print("Actual game outcomes not available; skipping game model training.")
+        return None, features
+    merged_features["actual_point_diff"] = merged_features["scoring_homeScoreTotal"] - merged_features[
+        "scoring_awayScoreTotal"]
     historical = merged_features.dropna(subset=["actual_point_diff"] + features)
     print("Training data shape:", historical.shape)
+    if historical.empty:
+        print("No historical rows with actual outcomes; skipping game model training.")
+        return None, features
     X = historical[features]
     y = historical["actual_point_diff"]
     print("Correlation of features with actual point diff:")
@@ -2158,25 +2799,11 @@ def train_game_prediction_model_with_optuna_cv(merged_features, n_trials=1000):
     print("Best trial (CV):", study.best_trial.params)
     best_params = study.best_trial.params
 
-    # Build an ensemble stacking pipeline with enhanced preprocessing.
-    from sklearn.ensemble import StackingRegressor
-    from sklearn.linear_model import LinearRegression
-    # Base models remain similar.
-    base_models = [
-        ('xgb', XGBRegressor(**best_params, objective="reg:pseudohubererror", random_state=42)),
-    ]
-    # Use a pipeline that performs robust scaling and a PCA reduction before the regressor.
-    stacking_pipeline = Pipeline([
-        ("scaler", RobustScaler()),
-        ("pca", PCA(n_components=min(len(features), 10))),  # reduce to at most 10 components
-        ("regressor", StackingRegressor(
-            estimators=base_models,
-            final_estimator=LinearRegression()))
-    ])
-    cv_mse = time_series_cv_evaluation(stacking_pipeline, X, y, n_splits=5)
-    print("Stacking Ensemble CV MSE:", cv_mse)
-    stacking_pipeline.fit(X, y)
-    return stacking_pipeline, features
+    model = XGBRegressor(**best_params, objective="reg:pseudohubererror", random_state=42)
+    cv_mse = time_series_cv_evaluation(model, X, y, n_splits=5)
+    print("XGBoost CV MSE:", cv_mse)
+    model.fit(X, y)
+    return model, features
 
 
 def filter_low_minutes_players(df, min_minutes=5):
@@ -2429,10 +3056,18 @@ def parse_detailed_game_data(all_games_details):
                     box["temperature"] = box["weather"].get("temperature", {}).get("fahrenheit")
                 boxscore_list.append(box)
             pbp = details.get("playbyplay")
-            if pbp and isinstance(pbp, dict) and "plays" in pbp:
-                for play in pbp["plays"]:
-                    play_record = {"season": season, "game_id": game_id, **play}
-                    playbyplay_list.append(play_record)
+            if pbp and isinstance(pbp, dict):
+                plays = pbp.get("plays")
+                if plays is None:
+                    for key in ("gameplaybyplay", "gamePlayByPlay", "playByPlay", "playbyplay"):
+                        nested = pbp.get(key)
+                        if isinstance(nested, dict) and "plays" in nested:
+                            plays = nested.get("plays")
+                            break
+                if isinstance(plays, list):
+                    for play in plays:
+                        play_record = {"season": season, "game_id": game_id, **play}
+                        playbyplay_list.append(play_record)
     boxscore_df = pd.DataFrame(boxscore_list)
     playbyplay_df = pd.DataFrame(playbyplay_list)
     print("Detailed game data: boxscore shape =", boxscore_df.shape, "playbyplay shape =", playbyplay_df.shape)
@@ -2453,6 +3088,34 @@ def feature_engineering(games_df, boxscore_df, playbyplay_df, team_stats_df, his
         lambda abbr: get_team_stat(team_stats_df, abbr, "stats_defense.ptsAgainstPerGame"))
     df["away_team_pts_allowed"] = df["away_team_abbr"].apply(
         lambda abbr: get_team_stat(team_stats_df, abbr, "stats_defense.ptsAgainstPerGame"))
+    rolling_scores = compute_team_rolling_scores(historical_games)
+    if not rolling_scores.empty and "local_date" in df.columns:
+        home_roll = rolling_scores.rename(
+            columns={
+                "team_abbr": "home_team_abbr",
+                "rolling_points_for": "home_team_pts_roll",
+                "rolling_points_against": "home_team_pts_allowed_roll",
+            }
+        )
+        away_roll = rolling_scores.rename(
+            columns={
+                "team_abbr": "away_team_abbr",
+                "rolling_points_for": "away_team_pts_roll",
+                "rolling_points_against": "away_team_pts_allowed_roll",
+            }
+        )
+        df = df.merge(home_roll, on=["home_team_abbr", "local_date"], how="left")
+        df = df.merge(away_roll, on=["away_team_abbr", "local_date"], how="left")
+        df["home_team_pts"] = df["home_team_pts_roll"].combine_first(df["home_team_pts"])
+        df["away_team_pts"] = df["away_team_pts_roll"].combine_first(df["away_team_pts"])
+        df["home_team_pts_allowed"] = df["home_team_pts_allowed_roll"].combine_first(df["home_team_pts_allowed"])
+        df["away_team_pts_allowed"] = df["away_team_pts_allowed_roll"].combine_first(df["away_team_pts_allowed"])
+        df = df.drop(columns=[
+            "home_team_pts_roll",
+            "away_team_pts_roll",
+            "home_team_pts_allowed_roll",
+            "away_team_pts_allowed_roll"
+        ])
     df["home_team_ast"] = df["home_team_abbr"].apply(
         lambda abbr: get_team_stat(team_stats_df, abbr, "stats_offense.astPerGame"))
     df["away_team_ast"] = df["away_team_abbr"].apply(
@@ -2477,7 +3140,7 @@ def feature_engineering(games_df, boxscore_df, playbyplay_df, team_stats_df, his
     return df
 
 
-def train_game_prediction_model_with_optuna(merged_features, n_trials=1000):
+def train_game_prediction_model_with_optuna(merged_features, n_trials=10):
     features = [
         "home_team_pts", "away_team_pts",
         "home_team_pts_allowed", "away_team_pts_allowed",
@@ -2495,38 +3158,55 @@ def train_game_prediction_model_with_optuna(merged_features, n_trials=1000):
         "predicted_point_diff_adj"
     ]
     features = [f for f in features if f in merged_features.columns]
-    if "scoring_homeScoreTotal" in merged_features.columns and "scoring_awayScoreTotal" in merged_features.columns:
-        merged_features["actual_point_diff"] = merged_features["scoring_homeScoreTotal"] - merged_features[
-            "scoring_awayScoreTotal"]
-    else:
-        merged_features["actual_point_diff"] = merged_features["predicted_point_diff"]
+    if "scoring_homeScoreTotal" not in merged_features.columns or "scoring_awayScoreTotal" not in merged_features.columns:
+        print("Actual game outcomes not available; skipping game model training.")
+        return None, features
+    merged_features["actual_point_diff"] = merged_features["scoring_homeScoreTotal"] - merged_features[
+        "scoring_awayScoreTotal"]
     historical = merged_features.dropna(subset=["actual_point_diff"] + features)
     print("Training data shape:", historical.shape)
+    if historical.empty:
+        print("No historical rows with actual outcomes; skipping game model training.")
+        return None, features
     X = historical[features]
     y = historical["actual_point_diff"]
     print("Correlation of features with actual point diff:")
     corr_matrix = historical[features + ["actual_point_diff"]].corr()
     print(corr_matrix["actual_point_diff"].sort_values(ascending=False))
-    X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
     study = optuna.create_study(direction="minimize")
-    study.optimize(lambda trial: optuna_objective(trial, X_train, X_val, y_train, y_val), n_trials=n_trials)
+    study.optimize(lambda trial: time_series_cv_evaluation(
+        XGBRegressor(
+            n_estimators=trial.suggest_int('n_estimators', 500, 2000),
+            max_depth=trial.suggest_int('max_depth', 3, 10),
+            learning_rate=trial.suggest_float('learning_rate', 0.01, 0.3, log=True),
+            subsample=trial.suggest_float('subsample', 0.5, 1.0),
+            colsample_bytree=trial.suggest_float('colsample_bytree', 0.5, 1.0),
+            gamma=trial.suggest_float('gamma', 0, 5),
+            min_child_weight=trial.suggest_int('min_child_weight', 1, 10),
+            reg_alpha=trial.suggest_float('reg_alpha', 0, 1),
+            reg_lambda=trial.suggest_float('reg_lambda', 0, 1),
+            objective="reg:pseudohubererror",
+            random_state=42
+        ),
+        X,
+        y,
+        n_splits=5
+    ), n_trials=n_trials)
     print("Best trial:", study.best_trial.params)
     best_params = study.best_trial.params
     ensemble_models = []
     n_models = 10
     for seed in range(n_models):
         model = XGBRegressor(**best_params, objective="reg:pseudohubererror", random_state=42 + seed)
-        pipeline = Pipeline([("scaler", StandardScaler()), ("xgb", model)])
-        pipeline.fit(X_train, y_train)
-        ensemble_models.append(pipeline)
+        model.fit(X, y)
+        ensemble_models.append(model)
 
     def ensemble_predict(X):
         preds = np.mean([model.predict(X) for model in ensemble_models], axis=0)
         return preds
 
-    y_pred_ensemble = ensemble_predict(X_val)
-    mse_ensemble = mean_squared_error(y_val, y_pred_ensemble)
-    print("Ensemble Validation MSE:", mse_ensemble)
+    cv_mse = time_series_cv_evaluation(ensemble_models[0], X, y, n_splits=5)
+    print("Ensemble CV MSE:", cv_mse)
     return ensemble_predict, features
 
 
@@ -2560,6 +3240,8 @@ def train_player_stats_model(player_stats_df, daily_player_gamelogs_df, injuries
         stats_flat = pd.json_normalize(df["stats"]).add_prefix("stats_")
         df = df.drop(columns=["stats"]).reset_index(drop=True)
         df = pd.concat([df, stats_flat], axis=1)
+    if "game.startTime" in df.columns and "game_date" not in df.columns:
+        df["game_date"] = pd.to_datetime(df["game.startTime"], errors="coerce")
     if "player_id" not in df.columns:
         df["player_id"] = df["player"].apply(lambda x: x.get("id") if isinstance(x, dict) else x)
     print("Player stats dataframe shape after loading:", df.shape)
@@ -2600,7 +3282,6 @@ def train_player_stats_model(player_stats_df, daily_player_gamelogs_df, injuries
         "stats_freeThrows.ftAttPerGame",
         "stats_freeThrows.ftMadePerGame",
         "stats_freeThrows.ftPct",
-        "stats_rebounds.rebPerGame",
         "stats_rebounds.offRebPerGame",
         "stats_rebounds.defRebPerGame",
         "weighted_rolling_pts",
@@ -2632,7 +3313,15 @@ def train_player_stats_model(player_stats_df, daily_player_gamelogs_df, injuries
     print("Final training dataframe shape for player model:", df.shape)
     X = df[available_features]
     y = df[target_columns]
-    X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
+    train_df, val_df = time_ordered_split(df, test_size=0.2, date_col="game_date")
+    if train_df.empty or val_df.empty:
+        logging.warning("Insufficient ordered data for validation split; using full dataset for training.")
+        train_df = df
+        val_df = df
+    X_train = train_df[available_features]
+    y_train = train_df[target_columns]
+    X_val = val_df[available_features]
+    y_val = val_df[target_columns]
     from sklearn.multioutput import MultiOutputRegressor
     player_model = MultiOutputRegressor(
         XGBRegressor(objective="reg:pseudohubererror", n_estimators=500, learning_rate=0.01, random_state=42))
@@ -2791,10 +3480,6 @@ def add_rest_features(games_df, historical_games):
     return games_df
 
 
-def compute_win_probability(predicted_point_diff, scale=10.0):
-    return 1.0 / (1.0 + np.exp(-predicted_point_diff / scale))
-
-
 def kelly_criterion(probability, odds, fraction=1.0):
     edge = (probability * (odds - 1)) - (1 - probability)
     if edge <= 0:
@@ -2823,24 +3508,6 @@ def fetch_daily_player_gamelogs_for_teams(season, date_obj, teams):
     return df_logs
 
 
-def optuna_objective(trial, X_train, X_val, y_train, y_val):
-    params = {
-        'n_estimators': trial.suggest_int('n_estimators', 500, 2000),
-        'max_depth': trial.suggest_int('max_depth', 3, 10),
-        'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.3, log=True),
-        'subsample': trial.suggest_float('subsample', 0.5, 1.0),
-        'colsample_bytree': trial.suggest_float('colsample_bytree', 0.5, 1.0),
-        'gamma': trial.suggest_float('gamma', 0, 5),
-        'min_child_weight': trial.suggest_int('min_child_weight', 1, 10),
-        'reg_alpha': trial.suggest_float('reg_alpha', 0, 1),
-        'reg_lambda': trial.suggest_float('reg_lambda', 0, 1)
-    }
-    model = XGBRegressor(**params, objective="reg:pseudohubererror", random_state=42)
-    model.fit(X_train, y_train)
-    y_pred = model.predict(X_val)
-    return mean_squared_error(y_val, y_pred)
-
-
 def train_individual_models(X, y, trial):
     models = {}
     params = {
@@ -2857,19 +3524,14 @@ def train_individual_models(X, y, trial):
     return models
 
 
-import optuna
-from sklearn.multioutput import MultiOutputRegressor
-from sklearn.metrics import mean_squared_error
-from sklearn.model_selection import train_test_split
-from xgboost import XGBRegressor
-
-
 def train_player_stats_model_with_optuna(player_stats_df, daily_player_gamelogs_df, injuries_df, team_stats_df,
-                                         games_df, n_trials=10000, n_jobs=4):
+                                         games_df, n_trials=10, n_jobs=4):
     df = player_stats_df.copy()
     if "stats" in df.columns:
         stats_flat = pd.json_normalize(df["stats"]).add_prefix("stats_")
         df = pd.concat([df.drop(columns=["stats"]), stats_flat], axis=1)
+    if "game.startTime" in df.columns and "game_date" not in df.columns:
+        df["game_date"] = pd.to_datetime(df["game.startTime"], errors="coerce")
     if "player_id" not in df.columns:
         df["player_id"] = df["player"].apply(lambda x: x.get("id") if isinstance(x, dict) else x)
     print("Player stats dataframe shape after loading:", df.shape)
@@ -2910,7 +3572,6 @@ def train_player_stats_model_with_optuna(player_stats_df, daily_player_gamelogs_
         "stats_freeThrows.ftAttPerGame",
         "stats_freeThrows.ftMadePerGame",
         "stats_freeThrows.ftPct",
-        "stats_rebounds.rebPerGame",
         "stats_rebounds.offRebPerGame",
         "stats_rebounds.defRebPerGame",
         "weighted_rolling_pts",
@@ -2942,7 +3603,15 @@ def train_player_stats_model_with_optuna(player_stats_df, daily_player_gamelogs_
     print("Final training dataframe shape for player model:", df.shape)
     X = df[available_features]
     y = df[target_columns]
-    X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
+    train_df, val_df = time_ordered_split(df, test_size=0.2, date_col="game_date")
+    if train_df.empty or val_df.empty:
+        logging.warning("Insufficient ordered data for validation split; using full dataset for training.")
+        train_df = df
+        val_df = df
+    X_train = train_df[available_features]
+    y_train = train_df[target_columns]
+    X_val = val_df[available_features]
+    y_val = val_df[target_columns]
     from sklearn.multioutput import MultiOutputRegressor
     player_model = MultiOutputRegressor(
         XGBRegressor(objective="reg:pseudohubererror", n_estimators=500, learning_rate=0.01, random_state=42))
@@ -3255,18 +3924,53 @@ def main():
     print("Final today's features shape:", merged_features_today.shape)
     print("Historical features shape:", merged_features_hist.shape)
     print("Today's features shape:", merged_features_today.shape)
-    game_model, game_features = train_game_prediction_model_with_optuna_cv(merged_features_hist, n_trials=1000)
+    has_actuals = (
+        "scoring_homeScoreTotal" in merged_features_hist.columns
+        and "scoring_awayScoreTotal" in merged_features_hist.columns
+    )
+    if has_actuals:
+        merged_features_hist["actual_point_diff"] = (
+            merged_features_hist["scoring_homeScoreTotal"] - merged_features_hist["scoring_awayScoreTotal"]
+        )
+    readiness = {
+        "has_actual_outcomes": has_actuals,
+        "game_backtest_ran": False,
+        "prop_backtest_ran": False,
+        "historical_prop_rows": 0,
+        "odds_rows_ingested": 0,
+        "props_rows_ingested": 0
+    }
+    game_model, game_features = train_game_prediction_model_with_optuna_cv(merged_features_hist, n_trials=10)
     if game_model is not None:
+        nba_odds = get_nba_odds()  # fetch actual game odds
+        odds_rows = fetch_mysportsfeeds_game_odds(seasons[-1], TARGET_DATE)
+        inserted = store_mysportsfeeds_game_odds(odds_rows)
+        if inserted:
+            print(f"Stored {inserted} MySportsFeeds game odds rows for {TARGET_DATE}.")
+        readiness["odds_rows_ingested"] += inserted
+        hist_start = merged_features_hist["local_date"].min()
+        hist_end = merged_features_hist["local_date"].max()
+        hist_inserted = ingest_mysportsfeeds_odds_history(
+            seasons[-1],
+            hist_start,
+            hist_end,
+            max_days=ODDS_INGEST_LOOKBACK_DAYS
+        )
+        if hist_inserted:
+            print(f"Stored {hist_inserted} MySportsFeeds game odds rows for history window.")
+        readiness["odds_rows_ingested"] += hist_inserted
         X_today = merged_features_today[game_features].fillna(0)
         if X_today.shape[0] == 0:
             print("No games found for today's slate after feature prep; skipping game predictions.")
             return
-        X_hist = merged_features_hist[game_features].fillna(0).values
-        y_hist = merged_features_hist["actual_point_diff"].values
-        nn_model = train_nn_game_model(X_hist, y_hist, epochs=200, batch_size=64)
         ensemble_preds = game_model.predict(X_today)
-        nn_preds = nn_model.predict(X_today.values).flatten()
-        combined_preds = (ensemble_preds + nn_preds) / 2.0
+        combined_preds = ensemble_preds
+        if has_actuals:
+            X_hist = merged_features_hist[game_features].fillna(0).values
+            y_hist = merged_features_hist["actual_point_diff"].values
+            nn_model = train_nn_game_model(X_hist, y_hist, epochs=200, batch_size=64)
+            nn_preds = nn_model.predict(X_today.values).flatten()
+            combined_preds = (ensemble_preds + nn_preds) / 2.0
         historical_preds = game_model.predict(merged_features_hist[game_features].fillna(0))
         residuals = perform_residual_analysis(merged_features_hist, historical_preds)
         combined_preds_capped = cap_extreme_predictions(combined_preds, residuals, threshold=3)
@@ -3276,39 +3980,53 @@ def main():
         merged_features_today["predicted_away_score"] = merged_features_today.get("away_team_pts",
                                                                                   0) - combined_preds_capped / 2
         print(
-            "Game prediction models (stacking ensemble and NN) trained. Predictions for today's games updated with combined model.")
+            "Game prediction models (XGBoost and NN) trained. Predictions for today's games updated with combined model.")
         perform_residual_analysis(merged_features_hist, historical_preds)
-        backtest_betting_strategy(merged_features_hist, game_model, game_features,
-                                  {"player_points": 3.5, "player_assists": 2.5, "player_rebounds": 2.5,
-                                   "player_threes": 2.5})
+        if has_actuals:
+            msf_odds_df = fetch_mysportsfeeds_game_odds_from_db(
+                merged_features_hist["local_date"].min(),
+                merged_features_hist["local_date"].max()
+            )
+            backtest_betting_strategy(merged_features_hist, game_model, game_features,
+                                      {"player_points": 3.5, "player_assists": 2.5, "player_rebounds": 2.5,
+                                       "player_threes": 2.5}, nba_odds, msf_odds_df=msf_odds_df)
+            readiness["game_backtest_ran"] = True
+        else:
+            print("Skipping backtest due to missing actual outcomes.")
         schedule_retraining()
     else:
         print("Game-level model training was skipped; using pre-game predictions.")
 
     # --- AutoML Integration ---
-    try:
-        X_hist = merged_features_hist[game_features].fillna(0).values
-        y_hist = merged_features_hist["actual_point_diff"].values
-        auto_model, automl_history = train_autokeras_game_model(X_hist, y_hist, max_trials=3, epochs=30)
-        auto_preds = auto_model.predict(merged_features_today[game_features].fillna(0).values).flatten()
-        print("AutoML model predictions (first 5):", auto_preds[:5])
-    except Exception as e:
-        print("AutoML model training failed, using previous ensemble. Error:", e)
+    if has_actuals:
+        try:
+            X_hist = merged_features_hist[game_features].fillna(0).values
+            y_hist = merged_features_hist["actual_point_diff"].values
+            auto_model, automl_history = train_autokeras_game_model(X_hist, y_hist, max_trials=3, epochs=30)
+            auto_preds = auto_model.predict(merged_features_today[game_features].fillna(0).values).flatten()
+            print("AutoML model predictions (first 5):", auto_preds[:5])
+        except Exception as e:
+            print("AutoML model training failed, using previous ensemble. Error:", e)
+    else:
+        print("Skipping AutoML training due to missing actual outcomes.")
 
     nba_odds = get_nba_odds()  # fetch actual game odds
 
     # --- Reinforcement Learning Integration ---
     # For demonstration, we create dummy arrays (from historical predictions) as input to the RL environment.
     dummy_predictions = merged_features_hist["predicted_point_diff"].fillna(0).values
-    dummy_actuals = merged_features_hist["actual_point_diff"].fillna(0).values
-    # Use the new assign_game_odds to get an array of odds corresponding to each historical game.
-    actual_odds = assign_game_odds(merged_features_hist, nba_odds, default_odds=2.0)
+    if has_actuals:
+        dummy_actuals = merged_features_hist["actual_point_diff"].fillna(0).values
+        # Use the new assign_game_odds to get an array of odds corresponding to each historical game.
+        actual_odds = assign_game_odds(merged_features_hist, nba_odds, default_odds=2.0)
 
-    try:
-        rl_agent = train_rl_agent_for_betting(dummy_predictions, dummy_actuals, actual_odds, total_timesteps=1000)
-        print("RL agent trained for betting adjustment using realistic odds.")
-    except Exception as e:
-        print("RL agent training failed. Error:", e)
+        try:
+            rl_agent = train_rl_agent_for_betting(dummy_predictions, dummy_actuals, actual_odds, total_timesteps=1000)
+            print("RL agent trained for betting adjustment using realistic odds.")
+        except Exception as e:
+            print("RL agent training failed. Error:", e)
+    else:
+        print("Skipping RL agent training due to missing actual outcomes.")
 
     games_df["home_team_abbr"] = games_df["homeTeam"].apply(
         lambda x: x.get("abbreviation").upper().strip() if isinstance(x, dict) else str(x).upper().strip())
@@ -3323,7 +4041,7 @@ def main():
         process_injuries(injuries_data),
         team_stats_df,
         games_today_df,
-        n_trials=1000
+        n_trials=10
     )
 
     X = player_stats_ready_df[feat_cols].values
@@ -3337,6 +4055,10 @@ def main():
         print("Player stats model training failed.")
     global props_odds
     props_odds = get_all_player_props_odds(nba_odds)
+    props_inserted = store_player_props_history(props_odds, TARGET_DATE)
+    if props_inserted:
+        print(f"Stored {props_inserted} player props rows for {TARGET_DATE}.")
+    readiness["props_rows_ingested"] += int(props_inserted or 0)
     thresholds = {"player_points": 3.5, "player_assists": 2.5, "player_rebounds": 2.5, "player_threes": 2.5}
     player_team_map = {}
     for _, row in player_stats_ready_df.iterrows():
@@ -3364,6 +4086,15 @@ def main():
         print(f"Alt-line scan using DB gamelogs with {len(db_player_gamelogs)} rows.")
     else:
         print(f"Alt-line scan using API gamelogs with {len(seasonal_player_gamelogs)} rows.")
+    total_props_df = fetch_historical_props_from_db()
+    readiness["historical_prop_rows"] = len(total_props_df)
+    historical_props_df = fetch_historical_props_from_db(alt_cutoff)
+    if not historical_props_df.empty:
+        merged_props_df = build_prop_backtest_dataset(gamelog_source, historical_props_df)
+        evaluate_prop_backtest(merged_props_df)
+        readiness["prop_backtest_ran"] = not merged_props_df.empty
+    else:
+        print("No historical props available for out-of-sample prop evaluation.")
     alt_hit_rate_bets, alt_hit_rate_bets_by_game = compute_alt_lines_from_recent_games(
         gamelog_source,
         games_today_df,
@@ -3374,18 +4105,33 @@ def main():
         include_under=False,
         predicted_stats_by_player=predicted_stats_by_player
     )
+    readiness_ok = (
+        readiness["has_actual_outcomes"]
+        and readiness["game_backtest_ran"]
+        and readiness["prop_backtest_ran"]
+        and readiness["historical_prop_rows"] > 0
+    )
     print_alt_hit_rate_bets(alt_hit_rate_bets, window=10)
-    if alt_hit_rate_bets_by_game:
-        send_discord_alt_hit_rate_bets(alt_hit_rate_bets_by_game, window=10)
+    if readiness_ok:
+        if alt_hit_rate_bets_by_game:
+            send_discord_alt_hit_rate_bets(alt_hit_rate_bets_by_game, window=10)
+        else:
+            send_discord_message(
+                f"{PLAYBOOK_MENTION} No 100% alt-line hits found over the last 10 games ending "
+                f"{alt_cutoff}."
+            )
     else:
-        send_discord_message(
-            f"{PLAYBOOK_MENTION} No 100% alt-line hits found over the last 10 games ending "
-            f"{alt_cutoff}."
-        )
-    print_game_and_player_predictions(merged_features_today, player_stats_ready_df, player_model, feat_cols,
-                                      target_cols, nba_odds, props_odds, thresholds, team_stats_df)
-    build_html_predictions(merged_features_today, player_stats_ready_df, player_model, feat_cols, target_cols,
-                           nba_odds, props_odds, thresholds, team_stats_df)
+        print("Skipping Discord output because readiness checks are incomplete.")
+    if readiness_ok:
+        print_game_and_player_predictions(merged_features_today, player_stats_ready_df, player_model, feat_cols,
+                                          target_cols, nba_odds, props_odds, thresholds, team_stats_df)
+        build_html_predictions(merged_features_today, player_stats_ready_df, player_model, feat_cols, target_cols,
+                               nba_odds, props_odds, thresholds, team_stats_df)
+    else:
+        print("Skipping betting outputs because readiness checks are incomplete.")
+    print("\n=== Readiness Report ===")
+    for key, value in readiness.items():
+        print(f"{key}: {value}")
     print("Main routine processing complete.")
 
 

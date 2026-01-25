@@ -3056,10 +3056,18 @@ def parse_detailed_game_data(all_games_details):
                     box["temperature"] = box["weather"].get("temperature", {}).get("fahrenheit")
                 boxscore_list.append(box)
             pbp = details.get("playbyplay")
-            if pbp and isinstance(pbp, dict) and "plays" in pbp:
-                for play in pbp["plays"]:
-                    play_record = {"season": season, "game_id": game_id, **play}
-                    playbyplay_list.append(play_record)
+            if pbp and isinstance(pbp, dict):
+                plays = pbp.get("plays")
+                if plays is None:
+                    for key in ("gameplaybyplay", "gamePlayByPlay", "playByPlay", "playbyplay"):
+                        nested = pbp.get(key)
+                        if isinstance(nested, dict) and "plays" in nested:
+                            plays = nested.get("plays")
+                            break
+                if isinstance(plays, list):
+                    for play in plays:
+                        play_record = {"season": season, "game_id": game_id, **play}
+                        playbyplay_list.append(play_record)
     boxscore_df = pd.DataFrame(boxscore_list)
     playbyplay_df = pd.DataFrame(playbyplay_list)
     print("Detailed game data: boxscore shape =", boxscore_df.shape, "playbyplay shape =", playbyplay_df.shape)
